@@ -1,0 +1,703 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Go2 Robot Control</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #eee;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        .panel {
+            background: #16213e;
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+        }
+        h1 {
+            text-align: center;
+            margin-bottom: 20px;
+            color: #4cc9f0;
+            grid-column: span 2;
+        }
+        h2 {
+            color: #4cc9f0;
+            margin-bottom: 15px;
+            font-size: 1.1em;
+            border-bottom: 1px solid #333;
+            padding-bottom: 8px;
+        }
+        
+        /* Connection status */
+        .status {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 15px;
+        }
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #ef4444;
+        }
+        .status-dot.connected { background: #22c55e; }
+        
+        /* State display */
+        .state-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+        }
+        .state-item {
+            background: #0f172a;
+            padding: 12px;
+            border-radius: 8px;
+        }
+        .state-label {
+            font-size: 0.75em;
+            color: #888;
+            text-transform: uppercase;
+        }
+        .state-value {
+            font-size: 1.4em;
+            font-weight: bold;
+            font-family: 'SF Mono', monospace;
+            color: #4cc9f0;
+        }
+        
+        /* Canvas visualization */
+        #robot-canvas {
+            width: 100%;
+            height: 300px;
+            background: #0f172a;
+            border-radius: 8px;
+            margin-bottom: 15px;
+        }
+        
+        /* Camera */
+        #camera-feed {
+            width: 100%;
+            height: 300px;
+            background: #0f172a;
+            border-radius: 8px;
+            object-fit: contain;
+            display: block;
+        }
+        
+        /* Obstacle Map */
+        .obstacle-map-container {
+            background: #0a0a14;
+            border-radius: 8px;
+            padding: 10px;
+            overflow: hidden;
+        }
+        .obstacle-map {
+            font-family: 'Courier New', monospace;
+            font-size: 11px;
+            line-height: 1.1;
+            color: #4ade80;
+            white-space: pre;
+            text-align: center;
+            margin: 0;
+        }
+        .map-legend {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            font-size: 11px;
+            color: #888;
+            margin-top: 8px;
+        }
+        .map-legend span {
+            font-family: 'Courier New', monospace;
+        }
+        
+        /* Controls */
+        .controls {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        .control-row {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        .control-row label {
+            min-width: 80px;
+            font-size: 0.9em;
+        }
+        input[type="number"] {
+            width: 80px;
+            padding: 8px;
+            border: 1px solid #333;
+            border-radius: 6px;
+            background: #0f172a;
+            color: #eee;
+            font-family: 'SF Mono', monospace;
+        }
+        button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        button.primary {
+            background: #4cc9f0;
+            color: #000;
+        }
+        button.primary:hover { background: #3db8df; }
+        button.danger {
+            background: #ef4444;
+            color: #fff;
+        }
+        button.danger:hover { background: #dc2626; }
+        button.secondary {
+            background: #374151;
+            color: #fff;
+        }
+        button.secondary:hover { background: #4b5563; }
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        /* Emote buttons */
+        .emote-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 8px;
+        }
+        .emote-btn {
+            padding: 8px;
+            font-size: 0.85em;
+        }
+        
+        /* Progress indicator */
+        .progress-bar {
+            height: 8px;
+            background: #0f172a;
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 10px;
+        }
+        .progress-fill {
+            height: 100%;
+            background: #4cc9f0;
+            width: 0%;
+            transition: width 0.1s;
+        }
+        
+        /* Log */
+        #log {
+            background: #0f172a;
+            border-radius: 8px;
+            padding: 12px;
+            height: 150px;
+            overflow-y: auto;
+            font-family: 'SF Mono', monospace;
+            font-size: 0.8em;
+            grid-column: span 2;
+        }
+        .log-entry {
+            padding: 2px 0;
+            border-bottom: 1px solid #1e293b;
+        }
+        .log-time { color: #666; }
+        .log-success { color: #22c55e; }
+        .log-error { color: #ef4444; }
+        .log-info { color: #4cc9f0; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🐕 Go2 Robot Control</h1>
+        
+        <!-- State Panel -->
+        <div class="panel">
+            <h2>📊 Robot State</h2>
+            <div class="status">
+                <div class="status-dot" id="server-dot"></div>
+                <span id="server-text">Server: --</span>
+                <div class="status-dot" id="robot-dot" style="margin-left: 15px;"></div>
+                <span id="robot-text">Robot: --</span>
+            </div>
+            
+            <canvas id="robot-canvas"></canvas>
+            
+            <div class="state-grid">
+                <div class="state-item">
+                    <div class="state-label">Position X</div>
+                    <div class="state-value" id="state-x">0.000</div>
+                </div>
+                <div class="state-item">
+                    <div class="state-label">Position Y</div>
+                    <div class="state-value" id="state-y">0.000</div>
+                </div>
+                <div class="state-item">
+                    <div class="state-label">Yaw (deg)</div>
+                    <div class="state-value" id="state-yaw">0.0°</div>
+                </div>
+                <div class="state-item">
+                    <div class="state-label">Pitch (deg)</div>
+                    <div class="state-value" id="state-pitch">0.0°</div>
+                </div>
+                <div class="state-item">
+                    <div class="state-label">Roll (deg)</div>
+                    <div class="state-value" id="state-roll">0.0°</div>
+                </div>
+                <div class="state-item">
+                    <div class="state-label">Velocity</div>
+                    <div class="state-value" id="state-vel">0.00</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Obstacle Map Panel -->
+        <div class="panel">
+            <h2>🗺️ LiDAR Obstacle Map</h2>
+            <div class="obstacle-map-container">
+                <pre id="obstacle-map" class="obstacle-map">Waiting for LiDAR data...</pre>
+            </div>
+            <div class="map-legend">
+                <span>· empty</span>
+                <span>░ light</span>
+                <span>▒ medium</span>
+                <span>▓ dense</span>
+                <span>█ solid</span>
+                <span>◆ robot</span>
+            </div>
+            <div style="font-size: 11px; color: #888; margin-top: 5px;">2m × 2m area, bird's eye view (forward = up)</div>
+        </div>
+        
+        <!-- Camera Panel -->
+        <div class="panel">
+            <h2>📷 Camera</h2>
+            <img id="camera-feed" src="" alt="Camera feed">
+            <div style="margin-top: 10px; display: flex; gap: 10px;">
+                <button class="primary" onclick="takePhoto()">📸 Take Photo</button>
+                <button class="secondary" onclick="startAutoPhoto()">🔄 Auto (2s)</button>
+                <button class="secondary" onclick="stopAutoPhoto()">⏹ Stop</button>
+            </div>
+        </div>
+        
+        <!-- Movement Controls -->
+        <div class="panel">
+            <h2>🚶 Movement (Closed-Loop)</h2>
+            <div class="controls">
+                <div class="control-row">
+                    <label>Distance (m):</label>
+                    <input type="number" id="move-distance" value="0.5" step="0.1">
+                    <button class="primary" onclick="move(1)">⬆ Forward</button>
+                    <button class="primary" onclick="move(-1)">⬇ Back</button>
+                </div>
+                <div class="control-row">
+                    <label>Angle (deg):</label>
+                    <input type="number" id="turn-angle" value="90" step="15">
+                    <button class="primary" onclick="turn(1)">⬅ Left</button>
+                    <button class="primary" onclick="turn(-1)">➡ Right</button>
+                </div>
+                
+                <h3>👀 Look (Body Tilt)</h3>
+                <div class="control-row">
+                    <label>Yaw (°):</label>
+                    <input type="number" id="look-yaw" value="0" step="15" min="-45" max="45" style="width:60px">
+                    <label>Pitch (°):</label>
+                    <input type="number" id="look-pitch" value="0" step="10" min="-30" max="30" style="width:60px">
+                </div>
+                <div class="control-row">
+                    <button class="primary" onclick="look()">👀 Look</button>
+                    <button class="secondary" onclick="lookPreset('up')">⬆️ Up</button>
+                    <button class="secondary" onclick="lookPreset('down')">⬇️ Down</button>
+                    <button class="secondary" onclick="lookPreset('left')">⬅️ Left</button>
+                    <button class="secondary" onclick="lookPreset('right')">➡️ Right</button>
+                    <button class="secondary" onclick="lookPreset('center')">⊙ Center</button>
+                </div>
+                
+                <div class="control-row">
+                    <label>Progress:</label>
+                    <div class="progress-bar" style="flex: 1;">
+                        <div class="progress-fill" id="progress-fill"></div>
+                    </div>
+                    <span id="progress-text" style="min-width: 80px; text-align: right;">--</span>
+                </div>
+                <div class="control-row">
+                    <button class="danger always-enabled" onclick="abort()">🛑 STOP</button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Emotes & Poses -->
+        <div class="panel">
+            <h2>🎭 Emotes & Poses</h2>
+            <div class="emote-grid">
+                <button class="secondary emote-btn" onclick="emote('wave')">👋 Wave</button>
+                <button class="secondary emote-btn" onclick="emote('dance')">💃 Dance</button>
+                <button class="secondary emote-btn" onclick="emote('stretch')">🧘 Stretch</button>
+                <button class="secondary emote-btn" onclick="emote('wiggle')">🍑 Wiggle</button>
+                <button class="secondary emote-btn" onclick="emote('nod')">😊 Nod</button>
+                <button class="secondary emote-btn" onclick="emote('fingerheart')">🫰 Heart</button>
+                <button class="secondary emote-btn" onclick="emote('moonwalk')">🌙 Moonwalk</button>
+                <button class="secondary emote-btn" onclick="emote('handstand')">🤸 Handstand</button>
+            </div>
+            <div style="margin-top: 15px; display: flex; gap: 10px;">
+                <button class="secondary" onclick="pose('stand')">🧍 Stand</button>
+                <button class="secondary" onclick="pose('sit')">🪑 Sit</button>
+                <button class="secondary" onclick="pose('lie')">😴 Lie Down</button>
+            </div>
+        </div>
+        
+        <!-- Log -->
+        <div id="log"></div>
+    </div>
+
+    <script>
+        let ws = null;
+        let connected = false;
+        let autoPhotoInterval = null;
+        
+        // Position history for trail
+        const positionHistory = [];
+        const maxHistory = 100;
+        
+        // Canvas setup
+        const canvas = document.getElementById('robot-canvas');
+        const ctx = canvas.getContext('2d');
+        
+        function resizeCanvas() {
+            canvas.width = canvas.offsetWidth * window.devicePixelRatio;
+            canvas.height = canvas.offsetHeight * window.devicePixelRatio;
+            ctx.scale(window.devicePixelRatio, window.devicePixelRatio);
+        }
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+        
+        // Connect to server
+        function connect() {
+            ws = new WebSocket('ws://localhost:8765');
+            
+            ws.onopen = () => {
+                connected = true;
+                document.getElementById('server-dot').classList.add('connected');
+                document.getElementById('server-text').textContent = 'Server: ✓';
+                log('Connected to server', 'success');
+                
+                // Start state streaming (doesn't require robot)
+                sendCommand('startStateStream', {}, false);
+            };
+            
+            ws.onclose = () => {
+                connected = false;
+                robotConnected = false;
+                document.getElementById('server-dot').classList.remove('connected');
+                document.getElementById('server-text').textContent = 'Server: ✗';
+                document.getElementById('robot-dot').classList.remove('connected');
+                document.getElementById('robot-text').textContent = 'Robot: --';
+                log('Disconnected from server', 'error');
+                
+                // Reconnect after 2s
+                setTimeout(connect, 2000);
+            };
+            
+            ws.onerror = (e) => {
+                log('WebSocket error', 'error');
+            };
+            
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                handleMessage(msg);
+            };
+        }
+        
+        let robotConnected = false;
+        
+        function handleMessage(msg) {
+            if (msg.type === 'state') {
+                if (msg.robotConnected !== undefined && msg.robotConnected !== robotConnected) {
+                    robotConnected = msg.robotConnected;
+                    updateRobotStatus(robotConnected);
+                }
+                updateState(msg.data);
+                if (msg.obstacleMap) {
+                    updateObstacleMap(msg.obstacleMap);
+                }
+            } else if (msg.type === 'connected') {
+                robotConnected = msg.robotConnected;
+                updateRobotStatus(robotConnected);
+                if (msg.data) updateState(msg.data);
+            } else if (msg.type === 'connection') {
+                robotConnected = msg.connected;
+                updateRobotStatus(robotConnected);
+                log(robotConnected ? '🤖 Robot connected!' : '🔌 Robot disconnected', 
+                    robotConnected ? 'success' : 'error');
+            } else if (msg.type === 'response') {
+                if (msg.status === 'completed') {
+                    if (msg.data?.image) {
+                        document.getElementById('camera-feed').src = 'data:image/jpeg;base64,' + msg.data.image;
+                        log('📸 Photo captured!', 'success');
+                    }
+                    if (msg.data?.actual !== undefined) {
+                        const target = msg.data.target || 0;
+                        const actual = msg.data.actual || 0;
+                        log(`✅ Done: target=${target.toFixed(2)}, actual=${actual.toFixed(2)}`, 'success');
+                    } else if (!msg.data?.image) {
+                        log('✅ Command completed', 'success');
+                    }
+                } else if (msg.status === 'failed') {
+                    const reason = msg.data?.reason || msg.error || 'Unknown error';
+                    if (msg.error === 'stalled') {
+                        const actual = msg.data?.actual?.toFixed(2) || '?';
+                        const target = msg.data?.target?.toFixed(2) || '?';
+                        log(`🛑 Stalled! Moved ${actual} of ${target} - obstacle detected`, 'error');
+                    } else if (msg.error === 'aborted') {
+                        const actual = msg.data?.actual?.toFixed(2) || '?';
+                        log(`⏹️ Aborted at ${actual}`, 'info');
+                    } else if (msg.error === 'cancelled') {
+                        log(`↩️ Command cancelled (superseded)`, 'info');
+                    } else {
+                        log(`❌ Command failed: ${reason}`, 'error');
+                    }
+                } else if (msg.status === 'queued') {
+                    // Command accepted, wait for completion
+                }
+                document.getElementById('progress-fill').style.width = '100%';
+                setTimeout(() => {
+                    document.getElementById('progress-fill').style.width = '0%';
+                    document.getElementById('progress-text').textContent = '--';
+                }, 500);
+            } else if (msg.type === 'progress') {
+                const pct = Math.abs(msg.data.actual / msg.data.target * 100);
+                document.getElementById('progress-fill').style.width = Math.min(pct, 100) + '%';
+                document.getElementById('progress-text').textContent = 
+                    `${msg.data.actual.toFixed(2)} / ${msg.data.target.toFixed(2)}`;
+            } else if (msg.type === 'error') {
+                log(`Error: ${msg.error}`, 'error');
+            }
+        }
+        
+        function updateRobotStatus(connected) {
+            if (connected) {
+                document.getElementById('robot-dot').classList.add('connected');
+                document.getElementById('robot-text').textContent = 'Robot: ✓';
+            } else {
+                document.getElementById('robot-dot').classList.remove('connected');
+                document.getElementById('robot-text').textContent = 'Robot: ✗ (waiting...)';
+            }
+        }
+        
+        function updateState(state) {
+            document.getElementById('state-x').textContent = state.x.toFixed(3);
+            document.getElementById('state-y').textContent = state.y.toFixed(3);
+            document.getElementById('state-yaw').textContent = (state.yaw * 180 / Math.PI).toFixed(1) + '°';
+            document.getElementById('state-pitch').textContent = (state.pitch * 180 / Math.PI).toFixed(1) + '°';
+            document.getElementById('state-roll').textContent = (state.roll * 180 / Math.PI).toFixed(1) + '°';
+            
+            const vel = Math.sqrt(state.vx * state.vx + state.vy * state.vy);
+            document.getElementById('state-vel').textContent = vel.toFixed(2) + ' m/s';
+            
+            // Add to history
+            positionHistory.push({ x: state.x, y: state.y, yaw: state.yaw });
+            if (positionHistory.length > maxHistory) positionHistory.shift();
+            
+            drawRobot(state);
+        }
+        
+        function updateObstacleMap(mapStr) {
+            const mapEl = document.getElementById('obstacle-map');
+            if (mapStr && mapStr.length > 0) {
+                mapEl.textContent = mapStr;
+            }
+        }
+        
+        function drawRobot(state) {
+            const w = canvas.offsetWidth;
+            const h = canvas.offsetHeight;
+            const scale = 100; // pixels per meter
+            const cx = w / 2;
+            const cy = h / 2;
+            
+            ctx.clearRect(0, 0, w, h);
+            
+            // Grid
+            ctx.strokeStyle = '#1e293b';
+            ctx.lineWidth = 1;
+            for (let x = 0; x < w; x += scale / 2) {
+                ctx.beginPath();
+                ctx.moveTo(x, 0);
+                ctx.lineTo(x, h);
+                ctx.stroke();
+            }
+            for (let y = 0; y < h; y += scale / 2) {
+                ctx.beginPath();
+                ctx.moveTo(0, y);
+                ctx.lineTo(w, y);
+                ctx.stroke();
+            }
+            
+            // Origin cross
+            ctx.strokeStyle = '#374151';
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(cx - 10, cy);
+            ctx.lineTo(cx + 10, cy);
+            ctx.moveTo(cx, cy - 10);
+            ctx.lineTo(cx, cy + 10);
+            ctx.stroke();
+            
+            // Trail
+            if (positionHistory.length > 1) {
+                ctx.strokeStyle = '#4cc9f044';
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                const first = positionHistory[0];
+                ctx.moveTo(cx + first.x * scale, cy - first.y * scale);
+                for (const p of positionHistory) {
+                    ctx.lineTo(cx + p.x * scale, cy - p.y * scale);
+                }
+                ctx.stroke();
+            }
+            
+            // Robot
+            const rx = cx + state.x * scale;
+            const ry = cy - state.y * scale; // Flip Y
+            const size = 15;
+            
+            ctx.save();
+            ctx.translate(rx, ry);
+            ctx.rotate(-state.yaw); // Rotate by yaw
+            
+            // Body
+            ctx.fillStyle = '#4cc9f0';
+            ctx.beginPath();
+            ctx.moveTo(size, 0);
+            ctx.lineTo(-size / 2, -size / 2);
+            ctx.lineTo(-size / 2, size / 2);
+            ctx.closePath();
+            ctx.fill();
+            
+            ctx.restore();
+            
+            // Coordinates text
+            ctx.fillStyle = '#888';
+            ctx.font = '11px SF Mono, monospace';
+            ctx.fillText(`(${state.x.toFixed(2)}, ${state.y.toFixed(2)})`, rx + 20, ry);
+        }
+        
+        function sendCommand(command, params, requireRobot = true) {
+            if (!connected) {
+                log('Not connected to server', 'error');
+                return;
+            }
+            if (requireRobot && !robotConnected) {
+                log('Robot not connected (waiting for it to wake up...)', 'error');
+                return;
+            }
+            ws.send(JSON.stringify({
+                type: 'command',
+                command: command,
+                id: Date.now().toString(),
+                params: params
+            }));
+        }
+        
+        // Controls
+        function move(direction) {
+            const distance = parseFloat(document.getElementById('move-distance').value) * direction;
+            log(`Moving ${distance.toFixed(2)}m...`, 'info');
+            sendCommand('move', { distance: distance, speed: 0.3 });
+        }
+        
+        function turn(direction) {
+            const angle = parseFloat(document.getElementById('turn-angle').value) * direction;
+            log(`Turning ${angle}°...`, 'info');
+            sendCommand('turn', { angle: angle });
+        }
+        
+        function look() {
+            const yaw = parseFloat(document.getElementById('look-yaw').value);
+            const pitch = parseFloat(document.getElementById('look-pitch').value);
+            log(`👀 Looking: yaw=${yaw}°, pitch=${pitch}°...`, 'info');
+            sendCommand('look', { yaw: yaw, pitch: pitch, hold: true });
+        }
+        
+        function lookPreset(direction) {
+            const presets = {
+                'up': { yaw: 0, pitch: 25 },
+                'down': { yaw: 0, pitch: -25 },
+                'left': { yaw: 30, pitch: 0 },
+                'right': { yaw: -30, pitch: 0 },
+                'center': { yaw: 0, pitch: 0 }
+            };
+            const preset = presets[direction] || { yaw: 0, pitch: 0 };
+            document.getElementById('look-yaw').value = preset.yaw;
+            document.getElementById('look-pitch').value = preset.pitch;
+            log(`👀 Looking ${direction}: yaw=${preset.yaw}°, pitch=${preset.pitch}°...`, 'info');
+            // For center, use hold=false to just reset quickly
+            sendCommand('look', { ...preset, hold: direction !== 'center' });
+        }
+        
+        function abort() {
+            log('Aborting...', 'error');
+            sendCommand('abort', {});
+        }
+        
+        function emote(name) {
+            log(`Playing emote: ${name}`, 'info');
+            sendCommand('playEmote', { emote: name });
+        }
+        
+        function pose(name) {
+            log(`Setting pose: ${name}`, 'info');
+            sendCommand('setPose', { pose: name });
+        }
+        
+        function takePhoto() {
+            log('Taking photo...', 'info');
+            sendCommand('takePhoto', {});
+        }
+        
+        function startAutoPhoto() {
+            if (autoPhotoInterval) return;
+            autoPhotoInterval = setInterval(takePhoto, 2000);
+            log('Auto photo started (2s interval)', 'info');
+        }
+        
+        function stopAutoPhoto() {
+            if (autoPhotoInterval) {
+                clearInterval(autoPhotoInterval);
+                autoPhotoInterval = null;
+                log('Auto photo stopped', 'info');
+            }
+        }
+        
+        function log(message, type = 'info') {
+            const logEl = document.getElementById('log');
+            const time = new Date().toLocaleTimeString();
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.innerHTML = `<span class="log-time">[${time}]</span> <span class="log-${type}">${message}</span>`;
+            logEl.appendChild(entry);
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+        
+        // Start
+        connect();
+        log('Connecting to Go2 server...', 'info');
+    </script>
+</body>
+</html>

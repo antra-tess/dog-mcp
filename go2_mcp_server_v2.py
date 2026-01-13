@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""
+Go2 MCP Server v2
+
+Exposes Unitree Go2 robot control as MCP tools and resources.
+Includes LiDAR obstacle map, look mode, and robot state resources.
+"""
+
+import asyncio
+import json
+import base64
+import sys
+from typing import Any
+from datetime import datetime
+
+# MCP SDK
+from mcp.server import Server
+from mcp.server.stdio import stdio_server
+from mcp.types import Tool, TextContent, ImageContent, Resource
+from pydantic import AnyUrl
+
+# Our WebSocket client
+sys.path.insert(0, '/Users/olena/connectome-local/dog_mcp')
+from robot_dog_client import RobotDogClient
+
+
+# Global robot client and cached state
+robot: RobotDogClient = None
+cached_state: dict = {}
+cached_lidar: str = ""
+server = Server("go2-robot")
+
+
+async def ensure_connected():
+    """Ensure we're connected to the robot server"""
+    global robot
+    if robot is None or not robot.connected:
+        robot = RobotDogClient('localhost', 8765)
+        await robot.connect()
+    return robot
+
+
+async def get_current_state() -> dict:
+    """Get and cache current robot state"""
+    global cached_state
+    try:
+        r = await ensure_connected()
+        result = await r.get_state()
+        if result.get("status") == "completed":
+            cached_state = result.get("data", {})
+    except:
+        pass
+    return cached_state
+
+
+@server.list_resources()
+async def list_resources() -> list[Resource]:
+    """List available robot state resources"""
+    return [
+        Resource(
+            uri="robot://state/position",
+            name="Robot Position",
+            description="Current robot position (x, y, z) in meters from odometry",
+            mimeType="application/json"
+        ),
+        Resource(
+            uri="robot://state/orientation",
+            name="Robot Orientation", 
+            description="Current robot orientation (roll, pitch, yaw) in degrees",
+            mimeType="application/json"
+        ),
+        Resource(
+            uri="robot://state/velocity",
+            name="Robot Velocity",
+            description="Current robot velocity (vx, vy, vz) in m/s",
+            mimeType="application/json"
+        ),
+        Resource(
+            uri="robot://state/full",
+            name="Full Robot State",
+            description="Complete robot state including position, orientation, velocity, and mode",
+            mimeType="application/json"
+        ),
+        Resource(
+            uri="robot://lidar/obstacle_map",
+            name="LiDAR Obstacle Map",
+            description="ASCII visualization of obstacles around the robot (2m x 2m, forward=up)",
+            mimeType="text/plain"
+        )
+    ]
+
+
+@server.read_resource()
+async def read_resource(uri: AnyUrl) -> str:
+    """Read robot state resource"""
+    state = await get_current_state()
+    uri_str = str(uri)
+    
+    if uri_str == "robot://state/position":
+        return json.dumps({
+            "x": state.get("x", 0),
+            "y": state.get("y", 0),
+            "z": state.get("z", 0),
+            "unit": "meters"
+        }, indent=2)
+    
+    elif uri_str == "robot://state/orientation":
+        import math
+        return json.dumps({
+            "roll": round(math.degrees(state.get("roll", 0)), 2),
+            "pitch": round(math.degrees(state.get("pitch", 0)), 2),
+            "yaw": round(math.degrees(state.get("yaw", 0)), 2),
+            "unit": "degrees"
+        }, indent=2)
+    
+    elif uri_str == "robot://state/velocity":
+        return json.dumps({
+            "vx": state.get("vx", 0),
+            "vy": state.get("vy", 0),
+            "vz": state.get("vz", 0),
+            "yaw_speed": state.get("yaw_speed", 0),
+            "unit": "m/s"
+        }, indent=2)
+    
+    elif uri_str == "robot://state/full":
+        return json.dumps(state, indent=2)
+    
+    elif uri_str == "robot://lidar/obstacle_map":
+        return state.get("obstacleMap", "No LiDAR data available")
+    
+    else:
+        return f"Unknown resource: {uri_str}"
+
+
+@server.list_tools()
+async def list_tools() -> list[Tool]:
+    """List available robot control tools"""
+    return [
+        Tool(
+            name="move",
+            description="Move the robot forward or backward with closed-loop control. Returns success/failure with distance traveled.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "distance": {
+                        "type": "number",
+                        "description": "Distance in meters (positive=forward, negative=backward)"
+                    },
+                    "speed": {
+                        "type": "number",
+                        "description": "Speed in m/s (default 0.3)",
+                        "default": 0.3
+                    }
+                },
+                "required": ["distance"]
+            }
+        ),
+        Tool(
+            name="turn",
+            description="Turn the robot left or right with closed-loop control. Returns success/failure with angle turned.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "angle": {
+                        "type": "number",
+                        "description": "Angle in degrees (positive=left/counterclockwise, negative=right/clockwise)"
+                    },
+                    "speed": {
+                        "type": "number",
+                        "description": "Turn speed in degrees/second (default 30)",
+                        "default": 30
+                    }
+                },
+                "required": ["angle"]
+            }
+        ),
+        Tool(
+            name="look",
+            description="Tilt the robot body to point camera in a direction (legs stay stationary). Use to look around without moving.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "yaw": {
+                        "type": "number",
+                        "description": "Yaw angle in degrees (positive=left, negative=right). Range: -30 to 30",
+                        "default": 0
+                    },
+                    "pitch": {
+                        "type": "number",
+                        "description": "Pitch angle in degrees (positive=up, negative=down). Range: -40 to 40",
+                        "default": 0
+                    },
+                    "hold": {
+                        "type": "boolean",
+                        "description": "If true, maintain the look until another command. If false, look and return.",
+                        "default": False
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="get_obstacle_map",
+            description="Get the current LiDAR obstacle map as ASCII art. Shows 2m x 2m area around robot, forward=up.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        ),
+        Tool(
+            name="take_photo",
+            description="Take a photo from the robot's front camera.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        ),
+        Tool(
+            name="play_emote",
+            description="Play an animation/emote.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "emote": {
+                        "type": "string",
+                        "description": "Emote name",
+                        "enum": ["wave", "hello", "nod", "shake", "dance", "dance1", "dance2", 
+                                "stretch", "wiggle", "fingerheart", "moonwalk", "handstand", 
+                                "frontflip", "backflip"]
+                    }
+                },
+                "required": ["emote"]
+            }
+        ),
+        Tool(
+            name="set_pose",
+            description="Set the robot's pose: sit, stand, or lie down",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "pose": {
+                        "type": "string",
+                        "description": "Pose name",
+                        "enum": ["sit", "stand", "lie", "down"]
+                    }
+                },
+                "required": ["pose"]
+            }
+        ),
+        Tool(
+            name="abort",
+            description="Immediately stop any currently executing motion command",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        ),
+        Tool(
+            name="get_state",
+            description="Get complete robot state including position, orientation, velocity",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        )
+    ]
+
+
+def format_result(result: dict, command: str) -> str:
+    """Format command result with status code"""
+    status = result.get("status", "unknown")
+    data = result.get("data", {})
+    error = result.get("error")
+    
+    if status == "completed":
+        return f"✅ {command}: SUCCESS\n{json.dumps(data, indent=2) if data else ''}"
+    elif status == "failed":
+        reason = error or data.get("reason", "unknown")
+        return f"❌ {command}: FAILED - {reason}"
+    elif status == "cancelled":
+        return f"⚠️ {command}: CANCELLED"
+    elif status == "stalled":
+        return f"⚠️ {command}: STALLED (obstacle?)"
+    else:
+        return f"ℹ️ {command}: {status}\n{json.dumps(data, indent=2) if data else ''}"
+
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
+    """Execute a robot control tool"""
+    try:
+        r = await ensure_connected()
+        
+        if name == "move":
+            distance = arguments.get("distance", 0)
+            speed = arguments.get("speed", 0.3)
+            result = await r.move(distance, speed)
+            
+            direction = "forward" if distance > 0 else "backward"
+            actual = result.get("data", {}).get("actual_distance", abs(distance))
+            text = format_result(result, f"Move {direction} {abs(distance)}m")
+            if result.get("status") == "completed":
+                text += f"\nActual distance: {actual:.3f}m"
+            return [TextContent(type="text", text=text)]
+        
+        elif name == "turn":
+            angle = arguments.get("angle", 0)
+            speed = arguments.get("speed", 30)
+            result = await r.turn(angle, speed)
+            
+            direction = "left" if angle > 0 else "right"
+            actual = result.get("data", {}).get("actual_angle", abs(angle))
+            text = format_result(result, f"Turn {direction} {abs(angle)}°")
+            if result.get("status") == "completed":
+                text += f"\nActual angle: {actual:.1f}°"
+            return [TextContent(type="text", text=text)]
+        
+        elif name == "look":
+            yaw = arguments.get("yaw", 0)
+            pitch = arguments.get("pitch", 0)
+            hold = arguments.get("hold", False)
+            
+            # Send look command via WebSocket
+            result = await r._send_command("look", {
+                "yaw": yaw,
+                "pitch": pitch,
+                "hold": hold,
+                "relative": True
+            })
+            
+            text = format_result(result, f"Look yaw={yaw}° pitch={pitch}°")
+            return [TextContent(type="text", text=text)]
+        
+        elif name == "get_obstacle_map":
+            state = await get_current_state()
+            obstacle_map = state.get("obstacleMap", "")
+            
+            if obstacle_map:
+                return [TextContent(
+                    type="text",
+                    text=f"🗺️ LiDAR Obstacle Map (2m x 2m, forward=up)\n\n{obstacle_map}\n\nLegend: · empty, ░▒▓█ obstacle density, ◆ robot center, ▲ front"
+                )]
+            else:
+                return [TextContent(type="text", text="❌ No LiDAR data available")]
+        
+        elif name == "take_photo":
+            result = await r.take_photo()
+            
+            if result.get("status") == "completed" and result.get("data", {}).get("image"):
+                image_b64 = result["data"]["image"]
+                return [
+                    ImageContent(
+                        type="image",
+                        data=image_b64,
+                        mimeType="image/jpeg"
+                    ),
+                    TextContent(
+                        type="text",
+                        text=f"📸 Photo captured ({result['data'].get('size', 0)} bytes)"
+                    )
+                ]
+            else:
+                return [TextContent(type="text", text=format_result(result, "Take photo"))]
+        
+        elif name == "play_emote":
+            emote = arguments.get("emote", "wave")
+            result = await r.play_emote(emote)
+            return [TextContent(type="text", text=format_result(result, f"Play emote '{emote}'"))]
+        
+        elif name == "set_pose":
+            pose = arguments.get("pose", "stand")
+            result = await r.set_pose(pose)
+            return [TextContent(type="text", text=format_result(result, f"Set pose '{pose}'"))]
+        
+        elif name == "abort":
+            result = await r.abort_command("")
+            return [TextContent(type="text", text="🛑 Motion stopped")]
+        
+        elif name == "get_state":
+            state = await get_current_state()
+            import math
+            
+            # Format state nicely
+            formatted = {
+                "position": {
+                    "x": round(state.get("x", 0), 3),
+                    "y": round(state.get("y", 0), 3),
+                    "z": round(state.get("z", 0), 3)
+                },
+                "orientation_deg": {
+                    "roll": round(math.degrees(state.get("roll", 0)), 1),
+                    "pitch": round(math.degrees(state.get("pitch", 0)), 1),
+                    "yaw": round(math.degrees(state.get("yaw", 0)), 1)
+                },
+                "velocity": {
+                    "vx": round(state.get("vx", 0), 3),
+                    "vy": round(state.get("vy", 0), 3),
+                    "yaw_speed": round(state.get("yaw_speed", 0), 3)
+                },
+                "mode": state.get("mode", 0),
+                "gait_type": state.get("gait_type", 0)
+            }
+            
+            return [TextContent(
+                type="text",
+                text=f"📊 Robot State:\n{json.dumps(formatted, indent=2)}"
+            )]
+        
+        else:
+            return [TextContent(type="text", text=f"❌ Unknown tool: {name}")]
+            
+    except ConnectionError as e:
+        return [TextContent(type="text", text=f"❌ Connection error: {e}\nIs the robot server running?")]
+    except TimeoutError as e:
+        return [TextContent(type="text", text=f"⏱️ Command timed out: {e}")]
+    except Exception as e:
+        return [TextContent(type="text", text=f"❌ Error: {str(e)}")]
+
+
+async def main():
+    """Run the MCP server"""
+    async with stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream,
+            write_stream,
+            server.create_initialization_options()
+        )
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
