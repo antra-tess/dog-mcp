@@ -99,11 +99,16 @@ class Go2ServerV2:
         self._photo_total_chunks = 0
         self._photo_event: Optional[asyncio.Event] = None
         
-        # LiDAR obstacle map
+        # LiDAR obstacle map - asymmetric for forward-biased navigation
+        # Tuned for how I think about space while navigating
         self._obstacle_grid: str = ""
         self._lidar_enabled = False
-        self._grid_size = 30  # 30x30 characters
-        self._grid_range = 2.0  # 2m x 2m area
+        self._grid_width = 40   # characters left-right  
+        self._grid_height = 35  # characters front-back (taller for forward bias)
+        self._range_forward = 2.0   # meters ahead - I like to see where I'm going
+        self._range_back = 0.5      # meters behind - just awareness
+        self._range_left = 1.2      # meters left - a bit of peripheral margin
+        self._range_right = 1.2     # meters right - symmetric feels balanced
         
         # Command handlers
         self.command_handlers = {
@@ -369,27 +374,38 @@ class Go2ServerV2:
     def _points_to_ascii_grid(self, points) -> str:
         """Convert 3D point cloud to 2D ASCII obstacle map (bird's eye view)
         
-        Grid is centered on robot, showing obstacles in a 2m x 2m area
-        Enhanced with distance markers and clearer semantics
+        Asymmetric grid: more forward visibility, less behind
+        Tuned for comfortable navigation awareness
         """
-        grid_size = self._grid_size
-        grid_range = self._grid_range
-        half_range = grid_range / 2
-        cell_size = grid_range / grid_size
+        width = self._grid_width
+        height = self._grid_height
+        range_fwd = self._range_forward
+        range_back = self._range_back
+        range_left = self._range_left
+        range_right = self._range_right
         
-        # Get robot's current position and orientation to make points robot-relative
+        total_range_x = range_fwd + range_back  # front-back
+        total_range_y = range_left + range_right  # left-right
+        
+        cell_size_x = total_range_x / height
+        cell_size_y = total_range_y / width
+        
+        # Robot position in grid (not centered - biased toward back)
+        robot_row = int(range_back / cell_size_x)  # rows from bottom
+        robot_col = width // 2  # centered left-right
+        
+        # Get robot's current position and orientation
         robot_x = self.robot_state.x
         robot_y = self.robot_state.y
         robot_z = self.robot_state.z
         robot_yaw = self.robot_state.yaw
         
-        # Precompute rotation
         cos_yaw = math.cos(-robot_yaw)
         sin_yaw = math.sin(-robot_yaw)
         
         # Initialize grid and density
-        grid = [[' ' for _ in range(grid_size)] for _ in range(grid_size)]
-        density = [[0 for _ in range(grid_size)] for _ in range(grid_size)]
+        grid = [['·' for _ in range(width)] for _ in range(height)]
+        density = [[0 for _ in range(width)] for _ in range(height)]
         
         # Height filter
         min_height = robot_z - 0.2
@@ -405,101 +421,99 @@ class Go2ServerV2:
             if z < min_height or z > max_height:
                 continue
             
-            x = dx * cos_yaw - dy * sin_yaw
-            y = -(dx * sin_yaw + dy * cos_yaw)
+            # Rotate to robot frame
+            x = dx * cos_yaw - dy * sin_yaw  # forward/back
+            y = -(dx * sin_yaw + dy * cos_yaw)  # left/right
             
-            gx = int((x + half_range) / cell_size)
-            gy = int((y + half_range) / cell_size)
+            # Map to grid (x: -range_back to +range_fwd, y: -range_left to +range_right)
+            gx = int((x + range_back) / cell_size_x)
+            gy = int((y + range_left) / cell_size_y)
             
-            if 0 <= gx < grid_size and 0 <= gy < grid_size:
+            if 0 <= gx < height and 0 <= gy < width:
                 density[gx][gy] += 1
         
-        center = grid_size // 2
-        
-        # Convert density to semantic characters
-        # Using characters that convey meaning:
-        #   · = clear/safe to traverse
-        #   ○ = sparse detection (maybe noise or edge)
-        #   ● = solid obstacle detection
-        #   ▪ = dense obstacle  
-        #   ■ = wall/solid barrier
-        for i in range(grid_size):
-            for j in range(grid_size):
+        # Convert density to characters with semantic meaning
+        for i in range(height):
+            for j in range(width):
                 d = density[i][j]
                 if d == 0:
-                    grid[i][j] = '·'  # Clear
+                    grid[i][j] = '·'  # Clear - safe
                 elif d < 3:
-                    grid[i][j] = '○'  # Sparse - might be passable
-                elif d < 8:
-                    grid[i][j] = '●'  # Obstacle detected
-                elif d < 15:
-                    grid[i][j] = '▪'  # Dense obstacle
+                    grid[i][j] = '∘'  # Sparse - probably passable
+                elif d < 6:
+                    grid[i][j] = '○'  # Light obstacle
+                elif d < 12:
+                    grid[i][j] = '●'  # Solid obstacle
+                elif d < 20:
+                    grid[i][j] = '◉'  # Dense obstacle
                 else:
-                    grid[i][j] = '■'  # Solid wall
+                    grid[i][j] = '█'  # Wall
         
-        # Draw distance ring at ~0.5m (about 7-8 cells from center)
-        # This helps gauge "immediate vicinity" vs "further away"
-        ring_radius = int(0.5 / cell_size)  # 0.5m ring
-        for angle in range(0, 360, 10):
-            rad = math.radians(angle)
-            ri = center + int(ring_radius * math.cos(rad))
-            rj = center + int(ring_radius * math.sin(rad))
-            if 0 <= ri < grid_size and 0 <= rj < grid_size:
-                if grid[ri][rj] == '·':
-                    grid[ri][rj] = '+'  # 0.5m distance marker
+        # Draw distance markers (horizontal lines at 0.5m, 1m, 1.5m)
+        for dist in [0.5, 1.0, 1.5]:
+            row = int((dist + range_back) / cell_size_x)
+            if 0 <= row < height:
+                for j in range(width):
+                    if grid[row][j] == '·':
+                        grid[row][j] = '─' if dist == 1.0 else '┄'
         
-        # Draw robot body (simplified but clear)
-        robot_forward = 4
-        robot_back = 4
-        robot_left = 2
-        robot_right = 2
+        # Draw center line (vertical)
+        for i in range(height):
+            if grid[i][robot_col] in ['·', '─', '┄']:
+                grid[i][robot_col] = '│' if grid[i][robot_col] == '·' else '┼'
         
-        for dx in range(-robot_back, robot_forward + 1):
-            for dy in range(-robot_left, robot_right + 1):
-                gx = center + dx
-                gy = center + dy
-                if 0 <= gx < grid_size and 0 <= gy < grid_size:
-                    if dx == robot_forward:
-                        grid[gx][gy] = '▲' if dy == 0 else '='
-                    elif dx == -robot_back:
-                        grid[gx][gy] = '='
-                    elif dy == -robot_left or dy == robot_right:
-                        grid[gx][gy] = '|'
-                    else:
-                        grid[gx][gy] = ' '
+        # Draw robot body (compact but clear)
+        body_fwd = 3   # cells forward from center
+        body_back = 3  # cells back
+        body_side = 2  # cells to each side
         
-        grid[center][center] = '@'  # Robot center - @ is intuitive "you are here"
+        for dx in range(-body_back, body_fwd + 1):
+            for dy in range(-body_side, body_side + 1):
+                gx = robot_row + dx
+                gy = robot_col + dy
+                if 0 <= gx < height and 0 <= gy < width:
+                    if dx == body_fwd:  # Front
+                        grid[gx][gy] = '▲' if dy == 0 else '═'
+                    elif dx == -body_back:  # Back
+                        grid[gx][gy] = '═'
+                    elif abs(dy) == body_side:  # Sides
+                        grid[gx][gy] = '║'
+                    else:  # Interior
+                        grid[gx][gy] = '░'
         
-        # Build output with scale and direction labels
+        grid[robot_row][robot_col] = '◈'  # Me - feels more like "self" than @
+        
+        # Build output
         lines = []
+        lines.append(f"           ┌─ FORWARD ({range_fwd}m) ─┐")
+        lines.append(f"     LEFT  │{'·' * (width - 2)}│  RIGHT")
+        lines.append(f"    ┌──────{'─' * (width - 12)}──────┐")
         
-        # Top label
-        lines.append(f"         FORWARD (+1m)")
-        lines.append(f"    ←LEFT    ·    RIGHT→")
-        lines.append(f"    ┌{'─' * grid_size}┐")
-        
-        # Grid rows (reversed so forward is up)
+        # Distance labels on the side
         for i, row in enumerate(reversed(grid)):
-            row_idx = grid_size - 1 - i
-            dist_from_center = (row_idx - center) * cell_size
+            row_idx = height - 1 - i
+            dist = (row_idx - robot_row) * cell_size_x
             
-            # Add distance label at key positions
-            if abs(dist_from_center - 0.5) < cell_size:
-                label = "+.5m"
-            elif abs(dist_from_center + 0.5) < cell_size:
-                label = "-.5m"
-            elif row_idx == center:
-                label = "  0 "
+            # Label key distances
+            if abs(dist - 1.5) < cell_size_x * 0.6:
+                label = "1.5m"
+            elif abs(dist - 1.0) < cell_size_x * 0.6:
+                label = " 1m "
+            elif abs(dist - 0.5) < cell_size_x * 0.6:
+                label = ".5m "
+            elif abs(dist) < cell_size_x * 0.6:
+                label = " ◈  "
+            elif abs(dist + 0.5) < cell_size_x * 0.6:
+                label = "back"
             else:
                 label = "    "
             
             lines.append(f"{label}│{''.join(row)}│")
         
-        lines.append(f"    └{'─' * grid_size}┘")
-        lines.append(f"          BACK (-1m)")
+        lines.append(f"    └──────{'─' * (width - 12)}──────┘")
+        lines.append(f"              BEHIND ({range_back}m)")
         lines.append(f"")
-        lines.append(f"  · clear  ○ sparse  ● obstacle  ▪ dense  ■ wall")
-        lines.append(f"  + 0.5m ring    @ robot center    ▲ front")
+        lines.append(f"  · clear  ∘○● obstacle  ◉█ wall  ─┄ distance  ◈ me")
         
         return '\n'.join(lines)
     

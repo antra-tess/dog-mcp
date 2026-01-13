@@ -342,7 +342,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             if obstacle_map:
                 return [TextContent(
                     type="text",
-                    text=f"🗺️ LiDAR Obstacle Map (2m x 2m, forward=up)\n\n{obstacle_map}\n\nLegend: · empty, ░▒▓█ obstacle density, ◆ robot center, ▲ front"
+                    text=f"🗺️ LiDAR Obstacle Map\n\n{obstacle_map}"
                 )]
             else:
                 return [TextContent(type="text", text="❌ No LiDAR data available")]
