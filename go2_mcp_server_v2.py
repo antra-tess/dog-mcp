@@ -260,11 +260,25 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_state",
-            description="Get complete robot state including position, orientation, velocity",
+            description="Get complete robot state including position, orientation, velocity, battery",
             inputSchema={
                 "type": "object",
                 "properties": {},
                 "required": []
+            }
+        ),
+        Tool(
+            name="set_obstacle_avoidance",
+            description="Enable or disable automatic obstacle avoidance. Disable to navigate tight spaces manually (I can see with LiDAR!)",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "True to enable obstacle avoidance (safe but restrictive), False to disable (I take responsibility)"
+                    }
+                },
+                "required": ["enabled"]
             }
         )
     ]
@@ -380,9 +394,21 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             result = await r.abort_command("")
             return [TextContent(type="text", text="🛑 Motion stopped")]
         
+        elif name == "set_obstacle_avoidance":
+            enabled = arguments.get("enabled", True)
+            result = await r._send_command("setObstacleAvoidance", {"enabled": enabled})
+            status = "ENABLED 🛡️" if enabled else "DISABLED ⚠️"
+            text = f"Obstacle avoidance: {status}"
+            if not enabled:
+                text += "\n⚠️ Be careful! I'm navigating manually now."
+            return [TextContent(type="text", text=text)]
+        
         elif name == "get_state":
             state = await get_current_state()
             import math
+            
+            battery = state.get("battery", 0)
+            avoidance = state.get("obstacleAvoidance", True)
             
             # Format state nicely
             formatted = {
@@ -401,13 +427,23 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                     "vy": round(state.get("vy", 0), 3),
                     "yaw_speed": round(state.get("yaw_speed", 0), 3)
                 },
+                "battery": f"{battery}%",
+                "obstacle_avoidance": "ON" if avoidance else "OFF",
                 "mode": state.get("mode", 0),
                 "gait_type": state.get("gait_type", 0)
             }
             
+            # Add battery emoji
+            if battery > 50:
+                batt_icon = "🔋"
+            elif battery > 20:
+                batt_icon = "🪫"
+            else:
+                batt_icon = "⚠️🪫"
+            
             return [TextContent(
                 type="text",
-                text=f"📊 Robot State:\n{json.dumps(formatted, indent=2)}"
+                text=f"{batt_icon} Robot State:\n{json.dumps(formatted, indent=2)}"
             )]
         
         else:

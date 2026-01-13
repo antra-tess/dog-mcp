@@ -55,6 +55,9 @@ class RobotState:
     # Status
     mode: int = 0
     gait_type: int = 0
+    
+    # Battery (percentage, 0-100)
+    battery: int = 0
     body_height: float = 0.0
     foot_raise_height: float = 0.0
     
@@ -124,7 +127,11 @@ class Go2ServerV2:
             "abort": self.handle_abort,
             "startStateStream": self.handle_start_stream,
             "stopStateStream": self.handle_stop_stream,
+            "setObstacleAvoidance": self.handle_set_obstacle_avoidance,
         }
+        
+        # Obstacle avoidance state
+        self._obstacle_avoidance_enabled = True  # Default: ON for safety
         
         # Look mode state
         self._look_mode_active = False
@@ -289,6 +296,22 @@ class Go2ServerV2:
         
         self.robot.datachannel.pub_sub.subscribe(RTC_TOPIC['LF_SPORT_MOD_STATE'], state_callback)
         logger.info("📡 Subscribed to robot state updates")
+        
+        # Subscribe to low-level state for battery info
+        def lowstate_callback(message):
+            try:
+                data = message.get('data', {})
+                # Battery info is in bms_state (Battery Management System)
+                bms = data.get('bms_state', {})
+                if bms:
+                    # SOC = State of Charge (percentage)
+                    soc = bms.get('soc', 0)
+                    self.robot_state.battery = soc
+            except Exception as e:
+                pass  # Silently ignore battery parse errors
+        
+        self.robot.datachannel.pub_sub.subscribe(RTC_TOPIC['LOW_STATE'], lowstate_callback)
+        logger.info("🔋 Subscribed to battery updates")
         
         # Subscribe to LiDAR data
         await self._setup_lidar_subscription()
@@ -567,10 +590,17 @@ class Go2ServerV2:
     async def handle_move(self, params: Dict, command_id: str) -> Dict:
         """Move with closed-loop feedback - continuously sends velocity commands"""
         target_distance = params.get("distance", 0)
-        speed = min(abs(params.get("speed", 0.3)), 0.5)  # Cap speed
+        # Speed: default 0.4 m/s, minimum 0.2 m/s (robot doesn't respond well below this), max 0.5 m/s
+        requested_speed = abs(params.get("speed", 0.4))
+        speed = max(0.2, min(requested_speed, 0.5))
         timeout = params.get("timeout", 30)
-        stall_threshold = 0.02  # Must move at least 2cm per stall check period
-        stall_check_period = 1.0  # Check for stall every second
+        
+        # Stall detection - adaptive based on expected movement
+        # At 0.2 m/s we expect 20cm/s, at 0.5 m/s we expect 50cm/s
+        # Threshold is 10% of expected distance per check period (with 1cm minimum)
+        stall_check_period = 1.5  # Check every 1.5s (give time for ramp-up)
+        expected_distance_per_period = speed * stall_check_period
+        stall_threshold = max(0.01, expected_distance_per_period * 0.1)  # 10% of expected, min 1cm
         
         if abs(target_distance) < 0.01:
             return {"status": "completed", "data": {"distance": 0, "actual": 0}}
@@ -624,10 +654,11 @@ class Go2ServerV2:
                     break
                 
                 # Stall detection - check if we're making progress
-                if current_time - last_stall_check_time >= stall_check_period:
+                # Grace period: don't check until 2s elapsed (allow ramp-up)
+                if elapsed > 2.0 and current_time - last_stall_check_time >= stall_check_period:
                     distance_since_check = actual_distance - last_stall_check_distance
-                    if distance_since_check < stall_threshold and elapsed > 1.0:
-                        logger.warning(f"🛑 Stalled! Only moved {distance_since_check:.3f}m in {stall_check_period}s (obstacle?)")
+                    if distance_since_check < stall_threshold:
+                        logger.warning(f"🛑 Stalled! Only moved {distance_since_check:.3f}m in {stall_check_period}s (threshold: {stall_threshold:.3f}m)")
                         stalled = True
                         break
                     last_stall_check_time = current_time
@@ -683,10 +714,15 @@ class Go2ServerV2:
     async def handle_turn(self, params: Dict, command_id: str) -> Dict:
         """Turn with closed-loop feedback - continuously sends rotation commands"""
         target_angle_deg = params.get("angle", 0)
-        speed = min(abs(params.get("speed", 0.5)), 1.0)
+        # Speed: default 0.6 rad/s (~35°/s), minimum 0.3 rad/s, max 1.0 rad/s
+        requested_speed = abs(params.get("speed", 0.6))
+        speed = max(0.3, min(requested_speed, 1.0))
         timeout = params.get("timeout", 30)
-        stall_threshold_deg = 2.0  # Must rotate at least 2° per stall check period
-        stall_check_period = 1.0  # Check for stall every second
+        
+        # Stall detection - adaptive based on expected rotation
+        stall_check_period = 1.5  # Check every 1.5s
+        expected_angle_per_period = math.degrees(speed * stall_check_period)
+        stall_threshold_deg = max(1.0, expected_angle_per_period * 0.1)  # 10% of expected, min 1°
         
         if abs(target_angle_deg) < 1:
             return {"status": "completed", "data": {"angle": 0, "actual": 0}}
@@ -746,10 +782,11 @@ class Go2ServerV2:
                     break
                 
                 # Stall detection - check if we're making progress
-                if current_time - last_stall_check_time >= stall_check_period:
+                # Grace period: don't check until 2s elapsed (allow ramp-up)
+                if elapsed > 2.0 and current_time - last_stall_check_time >= stall_check_period:
                     angle_since_check = abs(actual_angle) - abs(last_stall_check_angle)
-                    if angle_since_check < stall_threshold and elapsed > 1.0:
-                        logger.warning(f"🛑 Stalled! Only turned {math.degrees(angle_since_check):.1f}° in {stall_check_period}s (obstacle?)")
+                    if angle_since_check < stall_threshold:
+                        logger.warning(f"🛑 Stalled! Only turned {math.degrees(angle_since_check):.1f}° in {stall_check_period}s (threshold: {stall_threshold_deg:.1f}°)")
                         stalled = True
                         break
                     last_stall_check_time = current_time
@@ -1005,7 +1042,32 @@ class Go2ServerV2:
         state = await self._get_current_state()
         data = asdict(state)
         data["obstacleMap"] = self._obstacle_grid  # Include LiDAR map
+        data["obstacleAvoidance"] = self._obstacle_avoidance_enabled
         return {"status": "completed", "data": data}
+    
+    async def handle_set_obstacle_avoidance(self, params: Dict, command_id: str) -> Dict:
+        """Enable or disable automatic obstacle avoidance"""
+        enabled = params.get("enabled", True)
+        
+        try:
+            # Send obstacle avoidance command to robot
+            # The API expects: {"switch": true/false}
+            await self.robot.datachannel.pub_sub.publish_request_new(
+                RTC_TOPIC['OBSTACLES_AVOID'],
+                {"switch": enabled}
+            )
+            
+            self._obstacle_avoidance_enabled = enabled
+            status = "enabled" if enabled else "disabled"
+            logger.info(f"🛡️ Obstacle avoidance {status}")
+            
+            return {
+                "status": "completed",
+                "data": {"enabled": enabled, "message": f"Obstacle avoidance {status}"}
+            }
+        except Exception as e:
+            logger.error(f"Failed to set obstacle avoidance: {e}")
+            return {"status": "failed", "error": str(e)}
     
     async def handle_take_photo(self, params: Dict, command_id: str) -> Dict:
         """Capture photo"""
