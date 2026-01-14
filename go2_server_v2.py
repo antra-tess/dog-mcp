@@ -1043,6 +1043,7 @@ class Go2ServerV2:
         data = asdict(state)
         data["obstacleMap"] = self._obstacle_grid  # Include LiDAR map
         data["obstacleAvoidance"] = self._obstacle_avoidance_enabled
+        data["robotConnected"] = self.robot_connected  # Is robot actually connected?
         return {"status": "completed", "data": data}
     
     async def handle_set_obstacle_avoidance(self, params: Dict, command_id: str) -> Dict:

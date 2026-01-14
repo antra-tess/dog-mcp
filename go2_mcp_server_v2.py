@@ -409,9 +409,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             
             battery = state.get("battery", 0)
             avoidance = state.get("obstacleAvoidance", True)
+            robot_connected = state.get("robotConnected", False)
             
             # Format state nicely
             formatted = {
+                "connected": robot_connected,
                 "position": {
                     "x": round(state.get("x", 0), 3),
                     "y": round(state.get("y", 0), 3),
@@ -433,6 +435,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 "gait_type": state.get("gait_type", 0)
             }
             
+            # Connection status icon
+            if robot_connected:
+                conn_icon = "🟢"
+            else:
+                conn_icon = "🔴 DISCONNECTED"
+            
             # Add battery emoji
             if battery > 50:
                 batt_icon = "🔋"
@@ -443,7 +451,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             
             return [TextContent(
                 type="text",
-                text=f"{batt_icon} Robot State:\n{json.dumps(formatted, indent=2)}"
+                text=f"{conn_icon} {batt_icon} Robot State:\n{json.dumps(formatted, indent=2)}"
             )]
         
         else:
