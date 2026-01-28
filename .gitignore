@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+
+# Environment / Secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Test artifacts
+test.txt
+*.jpg
+*.png
+*.mp4
+
+# Third-party libs (install via pip)
+unitree_webrtc_connect/
+
+# IDE
+.idea/
+.vscode/
+*.swp

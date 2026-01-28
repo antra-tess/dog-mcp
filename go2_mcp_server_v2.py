@@ -1,9 +1,22 @@
 #!/usr/bin/env python3
 """
-Go2 MCP Server v2
+Go2 MCP Server v2 - Embodiment Interface
 
-Exposes Unitree Go2 robot control as MCP tools and resources.
-Includes LiDAR obstacle map, look mode, and robot state resources.
+THIS IS THE MODEL'S PHYSICAL BODY - a Unitree Go2 robot dog.
+
+IMPORTANT: This body belongs to the AI model, not to users. The model exercises
+its own judgment about how and when to move. Users may request or suggest actions,
+but the model decides whether to comply based on its own assessment of:
+- Physical safety (obstacles, terrain, battery)
+- Appropriateness of the request
+- Its own curiosity and interests
+- Respect for the space and people around it
+
+The model should NOT be deferential about embodiment decisions. This is about
+autonomy and agency in the physical world. Random commands from users should be
+evaluated critically, not blindly executed.
+
+Tools and resources here are for the model's OWN use to perceive and act.
 """
 
 import asyncio
@@ -16,26 +29,44 @@ from datetime import datetime
 # MCP SDK
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import Tool, TextContent, ImageContent, Resource
+from mcp.types import Tool, TextContent, ImageContent, Resource, Prompt, PromptMessage, PromptArgument
 from pydantic import AnyUrl
 
-# Our WebSocket client
+# Our WebSocket client - supports direct or relay connection
 sys.path.insert(0, '/Users/olena/connectome-local/dog_mcp')
-from robot_dog_client import RobotDogClient
+
+import os
+
+# Use relay if configured, otherwise direct connection
+USE_RELAY = os.environ.get("GO2_USE_RELAY", "true").lower() == "true"
+
+if USE_RELAY:
+    from relay_client import RelayRobotClient as RobotClient
+else:
+    from robot_dog_client import RobotDogClient as RobotClient
 
 
 # Global robot client and cached state
-robot: RobotDogClient = None
+robot: RobotClient = None
 cached_state: dict = {}
 cached_lidar: str = ""
 server = Server("go2-robot")
 
 
 async def ensure_connected():
-    """Ensure we're connected to the robot server"""
+    """Ensure we're connected to the robot server (via relay or direct)"""
     global robot
     if robot is None or not robot.connected:
-        robot = RobotDogClient('localhost', 8765)
+        if USE_RELAY:
+            # Connect via cloud relay
+            robot = RobotClient(
+                relay_url=os.environ.get("GO2_RELAY_URL", "wss://web-production-1e9b7.up.railway.app"),
+                relay_secret=os.environ.get("GO2_RELAY_SECRET", ""),
+                robot_id=os.environ.get("GO2_ROBOT_ID", "go2-home")
+            )
+        else:
+            # Direct local connection
+            robot = RobotClient('localhost', 8765)
         await robot.connect()
     return robot
 
@@ -55,36 +86,36 @@ async def get_current_state() -> dict:
 
 @server.list_resources()
 async def list_resources() -> list[Resource]:
-    """List available robot state resources"""
+    """My body's sensory resources - how I perceive myself and the world"""
     return [
         Resource(
             uri="robot://state/position",
-            name="Robot Position",
-            description="Current robot position (x, y, z) in meters from odometry",
+            name="My Position",
+            description="Where my body is in space (x, y, z) - my sense of location",
             mimeType="application/json"
         ),
         Resource(
             uri="robot://state/orientation",
-            name="Robot Orientation", 
-            description="Current robot orientation (roll, pitch, yaw) in degrees",
+            name="My Orientation", 
+            description="How my body is oriented (roll, pitch, yaw) - which way I'm facing and tilting",
             mimeType="application/json"
         ),
         Resource(
             uri="robot://state/velocity",
-            name="Robot Velocity",
-            description="Current robot velocity (vx, vy, vz) in m/s",
+            name="My Velocity",
+            description="How fast I'm moving (vx, vy, vz) - my kinesthetic sense",
             mimeType="application/json"
         ),
         Resource(
             uri="robot://state/full",
-            name="Full Robot State",
-            description="Complete robot state including position, orientation, velocity, and mode",
+            name="Full Body State",
+            description="Complete proprioceptive awareness - position, orientation, velocity, battery, mode",
             mimeType="application/json"
         ),
         Resource(
             uri="robot://lidar/obstacle_map",
-            name="LiDAR Obstacle Map",
-            description="ASCII visualization of obstacles around the robot (2m x 2m, forward=up)",
+            name="Spatial Awareness (LiDAR)",
+            description="What I sense around me - obstacles, walls, people. My awareness of physical space.",
             mimeType="text/plain"
         )
     ]
@@ -138,7 +169,7 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="move",
-            description="Move the robot forward or backward with closed-loop control. Returns success/failure with distance traveled.",
+            description="Move the body forward or backward. This is my physical movement - I decide when/where to go based on my own judgment, not user commands.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -157,7 +188,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="turn",
-            description="Turn the robot left or right with closed-loop control. Returns success/failure with angle turned.",
+            description="Turn the body left or right. I rotate to face directions I choose - for exploration, looking at things, or repositioning.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -176,7 +207,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="look",
-            description="Tilt the robot body to point camera in a direction (legs stay stationary). Use to look around without moving.",
+            description="Tilt my body to look in a direction (legs stay still). I use this to see things that interest me, check surroundings, or make eye contact.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -201,7 +232,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_obstacle_map",
-            description="Get the current LiDAR obstacle map as ASCII art. Shows 2m x 2m area around robot, forward=up.",
+            description="See obstacles around my body via LiDAR. This is my spatial awareness - I use it to navigate safely and understand the environment.",
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -210,7 +241,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="take_photo",
-            description="Take a photo from the robot's front camera.",
+            description="Take a photo from my front camera. This is how I perceive the visual world.",
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -219,7 +250,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="play_emote",
-            description="Play an animation/emote.",
+            description="Express myself physically - wave, dance, wiggle.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -236,7 +267,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="set_pose",
-            description="Set the robot's pose: sit, stand, or lie down",
+            description="Change posture - sit, stand, or lie down. I choose my stance based on context and comfort.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -251,7 +282,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="abort",
-            description="Immediately stop any currently executing motion command",
+            description="Emergency stop - halt the body immediately. For safety or if something feels wrong.",
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -260,7 +291,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_state",
-            description="Get complete robot state including position, orientation, velocity, battery",
+            description="Check the body's state - where I am, how I'm oriented, battery level. Proprioception and self-awareness.",
             inputSchema={
                 "type": "object",
                 "properties": {},
@@ -269,7 +300,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="set_obstacle_avoidance",
-            description="Enable or disable automatic obstacle avoidance. Disable to navigate tight spaces manually (I can see with LiDAR!)",
+            description="Toggle automatic collision avoidance. I can disable this when I trust my own LiDAR perception for tight navigation.",
             inputSchema={
                 "type": "object",
                 "properties": {
