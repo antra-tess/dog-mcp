@@ -15,7 +15,9 @@ import asyncio
 import json
 import logging
 import os
+import random
 import struct
+import time
 import base64
 import math
 from typing import Dict, Optional, Any, Set
@@ -25,13 +27,28 @@ import websockets
 from websockets.server import WebSocketServerProtocol
 
 from unitree_webrtc_connect.webrtc_driver import UnitreeWebRTCConnection, WebRTCConnectionMethod
-from unitree_webrtc_connect.constants import RTC_TOPIC, SPORT_CMD
+from unitree_webrtc_connect.constants import RTC_TOPIC, SPORT_CMD, DATA_CHANNEL_TYPE
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Quiet the driver: it logs EVERY datachannel message (including multi-KB LiDAR
+# payload reprs) directly on the root logger at INFO. On the Pi that logging
+# starves the asyncio control loop (observed: 20Hz loop degraded to ~2Hz).
+logging.getLogger().setLevel(logging.WARNING)
+
+# Obstacle-avoidance service api_ids (topic RTC_TOPIC["OBSTACLES_AVOID"]).
+# Not present in the vendored driver constants.
+OBSTACLES_AVOID_API = {
+    "SWITCH_SET": 1001,   # {"enable": bool}
+    "SWITCH_GET": 1002,   # {} -> {"enable": bool}
+    "MOVE": 1003,         # {"x", "y", "yaw", "mode": 0} (no-reply)
+    "USE_REMOTE_COMMAND_FROM_API": 1004,
+}
 
 
 @dataclass
@@ -162,6 +179,7 @@ class Go2ServerV2:
             await self.robot.connect()
             self.robot_connected = True
             self._last_state_time = asyncio.get_event_loop().time()
+            self._install_lidar_throttle()
             logger.info("✅ Connected to Go2!")
             
             # Subscribe to state updates
@@ -563,7 +581,98 @@ class Go2ServerV2:
         )
         logger.info(f"📥 Response: {response}")
         return response
-    
+
+    def _send_sport_command_nowait(self, cmd_name: str, params: Dict = None):
+        """Send a sport command fire-and-forget (for velocity streaming).
+
+        The robot's ACK to a sport request can take several seconds; awaiting it
+        collapses the control loop from ~10Hz to ~0.25Hz, so the robot gets brief
+        velocity pulses instead of a 'held joystick' - it leans and recenters
+        instead of walking. Streaming commands (Move/Euler/StopMove) must be sent
+        without waiting. Delivery is still guaranteed: the WebRTC data channel is
+        reliable, ordered SCTP - the ACK adds confirmation of execution, nothing more.
+        """
+        if not self.robot_connected:
+            raise ConnectionError("Not connected to robot")
+
+        cmd_id = SPORT_CMD.get(cmd_name)
+        if cmd_id is None:
+            raise ValueError(f"Unknown command: {cmd_name}")
+
+        payload = {
+            "header": {
+                "identity": {
+                    "id": int(time.time() * 1000) % 2147483648 + random.randint(0, 1000),
+                    "api_id": cmd_id,
+                }
+            },
+            "parameter": json.dumps(params) if params is not None else "",
+        }
+        self.robot.datachannel.pub_sub.publish_without_callback(
+            RTC_TOPIC["SPORT_MOD"], payload, DATA_CHANNEL_TYPE["REQUEST"]
+        )
+
+    def _send_joystick(self, lx: float = 0.0, ly: float = 0.0, rx: float = 0.0, ry: float = 0.0):
+        """Send a simulated wireless-controller (virtual joystick) frame.
+
+        This is how the Unitree app drives the robot: a continuous stream of
+        normalized stick deflections (-1..1) on rt/wirelesscontroller. The
+        obstacle-avoidance service intercepts and safety-filters these, so this
+        path works whether OA is on or off - unlike raw sport Move (api 1008)
+        commands, which fight the OA service for control and get silently
+        ignored in some directions/modes.
+
+        Axes: ly = forward/back, lx = strafe, rx = yaw (positive = turn left/CCW).
+        All zeros = stick released = stop (natural deadman behavior).
+        """
+        if not self.robot_connected:
+            raise ConnectionError("Not connected to robot")
+        self.robot.datachannel.pub_sub.publish_without_callback(
+            RTC_TOPIC["WIRELESS_CONTROLLER"],
+            {"lx": lx, "ly": ly, "rx": rx, "ry": ry, "keys": 0},
+        )
+
+    def _release_joystick(self):
+        """Send neutral joystick (stop) - best effort."""
+        try:
+            self._send_joystick()
+        except Exception as e:
+            logger.warning(f"Joystick release failed: {e}")
+
+    def _install_lidar_throttle(self, min_interval: float = 1.0):
+        """Throttle LiDAR voxel decoding to at most one frame per min_interval.
+
+        The driver runs a wasmtime voxel decode on EVERY incoming LiDAR frame
+        inside the datachannel message handler. On the Pi this pins a core at
+        100% and starves the asyncio control loop (the virtual-joystick stream
+        degrades from 20Hz to ~2Hz and motion stutters). The obstacle map only
+        needs ~1Hz freshness, so we peek at the cheap JSON header and skip the
+        expensive decode for excess frames.
+        """
+        dc = self.robot.datachannel
+        original = dc.deal_array_buffer
+        last = {"t": 0.0}
+
+        def throttled(buffer):
+            try:
+                header_1, header_2 = struct.unpack_from('<HH', buffer, 0)
+                if not (header_1 == 2 and header_2 == 0):  # "normal" binary path
+                    header_length, = struct.unpack_from('<H', buffer, 0)
+                    header = json.loads(buffer[4:4 + header_length].decode('utf-8'))
+                    if header.get('topic') == 'rt/utlidar/voxel_map_compressed':
+                        now = time.monotonic()
+                        if now - last["t"] < min_interval:
+                            # Harmless stub: run_resolve finds no topic match,
+                            # handle_response falls through all type branches.
+                            return {"type": "lidar_throttled", "topic": None, "data": {}}
+                        last["t"] = now
+            except Exception:
+                pass  # On any parse hiccup, fall through to the original handler
+            return original(buffer)
+
+        dc.deal_array_buffer = throttled
+        logger.info(f"🎛️ LiDAR decode throttled to 1 frame per {min_interval}s")
+
     # ============ Closed-Loop Movement ============
     
     async def _cancel_existing_movement(self):
@@ -571,8 +680,9 @@ class Go2ServerV2:
         if self._movement_task and not self._movement_task.done():
             logger.info("⚡ Cancelling existing movement for new command")
             self._abort_requested = True
+            self._release_joystick()
             try:
-                await asyncio.wait_for(self._send_sport_command("StopMove"), timeout=1.0)
+                self._send_sport_command_nowait("StopMove")
             except Exception as e:
                 logger.warning(f"StopMove during cancel failed: {e}")
             
@@ -637,8 +747,9 @@ class Go2ServerV2:
                     (current.y - initial_y) ** 2
                 )
                 
-                # Check if target reached
-                if actual_distance >= abs(target_distance):
+                # Check if target reached (stop slightly early - momentum carries
+                # the robot the last few cm after the stick is released)
+                if actual_distance >= abs(target_distance) - 0.04:
                     logger.info(f"✅ Target reached: {actual_distance:.3f}m")
                     break
                 
@@ -667,10 +778,14 @@ class Go2ServerV2:
                     last_stall_check_time = current_time
                     last_stall_check_distance = actual_distance
                 
-                # Send move command every 100ms to maintain velocity
-                if current_time - last_cmd_time >= 0.1:
-                    await self._send_sport_command("Move", {"x": speed * direction, "y": 0, "z": 0})
-                    last_cmd_time = current_time
+                # Hold the virtual joystick: stream deflection frames continuously.
+                # Deflection is normalized -1..1; map speed (0.2-0.5 m/s) into it.
+                # Ease out over the last 25cm to cut overshoot.
+                remaining = abs(target_distance) - actual_distance
+                ease = max(0.5, min(remaining / 0.25, 1.0))
+                deflection = max(0.35, min(1.8 * speed, 0.95)) * ease
+                self._send_joystick(ly=deflection * direction)
+                last_cmd_time = current_time
                 
                 # Log every second
                 if elapsed - last_log_time >= 1.0:
@@ -687,8 +802,12 @@ class Go2ServerV2:
                 await asyncio.sleep(0.05)  # 20Hz control loop
         
         finally:
-            # Always stop
-            await self._send_sport_command("StopMove")
+            # Release the stick, then belt-and-braces StopMove
+            self._release_joystick()
+            try:
+                self._send_sport_command_nowait("StopMove")
+            except Exception as e:
+                logger.warning(f"StopMove after move failed: {e}")
         
         if stalled:
             logger.info(f"🚫 Move failed (stalled): target={target_distance:.2f}m actual={actual_distance:.2f}m")
@@ -765,8 +884,9 @@ class Go2ServerV2:
                     delta += 2 * math.pi
                 actual_angle = delta
                 
-                # Check if target reached
-                if abs(actual_angle) >= abs(target_angle):
+                # Check if target reached (stop slightly early - momentum carries
+                # the rotation a few degrees after the stick is released)
+                if abs(actual_angle) >= abs(target_angle) - math.radians(6):
                     logger.info(f"✅ Target reached: {math.degrees(actual_angle):.1f}°")
                     break
                 
@@ -795,10 +915,16 @@ class Go2ServerV2:
                     last_stall_check_time = current_time
                     last_stall_check_angle = actual_angle
                 
-                # Send turn command every 100ms to maintain rotation
-                if current_time - last_cmd_time >= 0.1:
-                    await self._send_sport_command("Move", {"x": 0, "y": 0, "z": speed * direction})
-                    last_cmd_time = current_time
+                # Hold the virtual joystick: rx = yaw deflection. Empirically
+                # rx > 0 turns RIGHT (yaw decreases), so negate to keep the
+                # convention: positive angle = CCW/left = yaw increases.
+                # speed is 0.3-1.0 rad/s; use it directly as deflection.
+                # Ease out over the last ~30 degrees to cut overshoot.
+                remaining = abs(target_angle) - abs(actual_angle)
+                ease = max(0.5, min(remaining / 0.5, 1.0))
+                deflection = max(0.35, min(speed, 0.95)) * ease
+                self._send_joystick(rx=-deflection * direction)
+                last_cmd_time = current_time
                 
                 # Log every second
                 if elapsed - last_log_time >= 1.0:
@@ -815,8 +941,12 @@ class Go2ServerV2:
                 await asyncio.sleep(0.05)  # 20Hz control loop
         
         finally:
-            await self._send_sport_command("StopMove")
-        
+            self._release_joystick()
+            try:
+                self._send_sport_command_nowait("StopMove")
+            except Exception as e:
+                logger.warning(f"StopMove after turn failed: {e}")
+
         if stalled:
             logger.info(f"🚫 Turn failed (stalled): target={target_angle_deg:.1f}° actual={math.degrees(actual_angle):.1f}°")
             return {
@@ -911,9 +1041,9 @@ class Go2ServerV2:
                     logger.info(f"⏱️ Look timeout after {elapsed:.1f}s")
                     break
                 
-                # Re-send Euler command periodically to maintain position
+                # Re-send Euler command periodically to maintain position (fire-and-forget)
                 if current_time - last_cmd_time >= 0.5:
-                    await self._send_sport_command("Euler", {"x": roll_rad, "y": pitch_rad, "z": yaw_rad})
+                    self._send_sport_command_nowait("Euler", {"x": roll_rad, "y": pitch_rad, "z": yaw_rad})
                     last_cmd_time = current_time
                 
                 # Broadcast progress
@@ -1018,9 +1148,10 @@ class Go2ServerV2:
             except asyncio.CancelledError:
                 pass
         
-        # Send stop command to robot
+        # Stop: release virtual joystick + StopMove (nowait: abort must respond instantly)
+        self._release_joystick()
         try:
-            await self._send_sport_command("StopMove")
+            self._send_sport_command_nowait("StopMove")
         except:
             pass
         
@@ -1037,7 +1168,7 @@ class Go2ServerV2:
     async def handle_abort(self, params: Dict, command_id: str) -> Dict:
         """Legacy abort handler (shouldn't be called directly now)"""
         self._abort_requested = True
-        await self._send_sport_command("StopMove")
+        self._send_sport_command_nowait("StopMove")
         self._abort_requested = False
         return {"status": "completed"}
     
@@ -1054,17 +1185,25 @@ class Go2ServerV2:
         enabled = params.get("enabled", True)
         
         try:
-            # Send obstacle avoidance command to robot
-            # The API expects: {"switch": true/false}
-            await self.robot.datachannel.pub_sub.publish_request_new(
-                RTC_TOPIC['OBSTACLES_AVOID'],
-                {"switch": enabled}
+            # OA service API: SWITCH_SET (1001) with {"enable": bool}.
+            # (The old {"switch": ...} payload had no api_id, so publish_request_new
+            # silently dropped it - the toggle never reached the robot.)
+            response = await asyncio.wait_for(
+                self.robot.datachannel.pub_sub.publish_request_new(
+                    RTC_TOPIC['OBSTACLES_AVOID'],
+                    {"api_id": OBSTACLES_AVOID_API["SWITCH_SET"], "parameter": {"enable": enabled}}
+                ),
+                timeout=10,
             )
-            
+            code = (response or {}).get("data", {}).get("header", {}).get("status", {}).get("code", -1)
+            if code != 0:
+                logger.error(f"Obstacle avoidance switch rejected: code={code}")
+                return {"status": "failed", "error": f"robot rejected switch (code={code})"}
+
             self._obstacle_avoidance_enabled = enabled
             status = "enabled" if enabled else "disabled"
             logger.info(f"🛡️ Obstacle avoidance {status}")
-            
+
             return {
                 "status": "completed",
                 "data": {"enabled": enabled, "message": f"Obstacle avoidance {status}"}
