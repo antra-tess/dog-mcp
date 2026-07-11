@@ -33,9 +33,8 @@ from mcp.types import Tool, TextContent, ImageContent, Resource, Prompt, PromptM
 from pydantic import AnyUrl
 
 # Our WebSocket client - supports direct or relay connection
-sys.path.insert(0, '/Users/olena/connectome-local/dog_mcp')
-
 import os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # Use relay if configured, otherwise direct connection
 USE_RELAY = os.environ.get("GO2_USE_RELAY", "true").lower() == "true"
