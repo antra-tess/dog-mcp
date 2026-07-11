@@ -1,0 +1,14 @@
+[Unit]
+Description=Go2 web UI (http://pi:8000)
+After=go2-server.service
+
+[Service]
+Type=simple
+User=rpi1
+WorkingDirectory=/home/rpi1/dog_mcp/web_ui
+ExecStart=/home/rpi1/dog_mcp/venv/bin/python -m http.server 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

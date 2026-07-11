@@ -389,7 +389,7 @@
         
         // Connect to server
         function connect() {
-            ws = new WebSocket('ws://localhost:8765');
+            ws = new WebSocket(`ws://${window.location.hostname || 'localhost'}:8765`);
             
             ws.onopen = () => {
                 connected = true;

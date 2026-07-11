@@ -14,6 +14,7 @@ import unitree_webrtc_connect
 import asyncio
 import json
 import logging
+import os
 import struct
 import base64
 import math
@@ -150,11 +151,13 @@ class Go2ServerV2:
     
     async def connect_to_robot(self) -> bool:
         """Connect to the Go2 robot (single attempt)"""
-        logger.info(f"Connecting to Go2 (serial: {self.serial_number})...")
+        robot_ip = os.environ.get("GO2_ROBOT_IP") or None
+        logger.info(f"Connecting to Go2 (serial: {self.serial_number}, ip: {robot_ip or 'discover'})...")
         try:
             self.robot = UnitreeWebRTCConnection(
                 WebRTCConnectionMethod.LocalSTA,
-                serialNumber=self.serial_number
+                serialNumber=self.serial_number,
+                ip=robot_ip
             )
             await self.robot.connect()
             self.robot_connected = True

@@ -1,0 +1,16 @@
+[Unit]
+Description=Go2 robot WebSocket server (WebRTC to dog over AP)
+After=network-online.target NetworkManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rpi1
+WorkingDirectory=/home/rpi1/dog_mcp
+EnvironmentFile=/home/rpi1/dog_mcp/.env
+ExecStart=/home/rpi1/dog_mcp/venv/bin/python go2_server_v2.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

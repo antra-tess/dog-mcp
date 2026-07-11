@@ -13,6 +13,7 @@ env/
 .env.*
 *.pem
 *.key
+start_relay.sh
 
 # Test artifacts
 test.txt
