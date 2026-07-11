@@ -236,6 +236,7 @@
                 <span id="server-text">Server: --</span>
                 <div class="status-dot" id="robot-dot" style="margin-left: 15px;"></div>
                 <span id="robot-text">Robot: --</span>
+                <span id="battery-badge" style="margin-left: auto; font-weight: bold;">🔋 --%</span>
             </div>
             
             <canvas id="robot-canvas"></canvas>
@@ -264,6 +265,10 @@
                 <div class="state-item">
                     <div class="state-label">Velocity</div>
                     <div class="state-value" id="state-vel">0.00</div>
+                </div>
+                <div class="state-item">
+                    <div class="state-label">Battery</div>
+                    <div class="state-value" id="state-battery">--%</div>
                 </div>
             </div>
         </div>
@@ -509,6 +514,19 @@
             
             const vel = Math.sqrt(state.vx * state.vx + state.vy * state.vy);
             document.getElementById('state-vel').textContent = vel.toFixed(2) + ' m/s';
+
+            // Battery (SOC from BMS; 0 can mean "not reported yet")
+            if (state.battery !== undefined && state.battery !== null && state.battery > 0) {
+                const pct = Math.round(state.battery);
+                const color = pct > 50 ? '#4ade80' : pct > 20 ? '#facc15' : '#f87171';
+                const icon = pct > 20 ? '🔋' : '🪫';
+                const batteryEl = document.getElementById('state-battery');
+                batteryEl.textContent = pct + '%';
+                batteryEl.style.color = color;
+                const badge = document.getElementById('battery-badge');
+                badge.textContent = `${icon} ${pct}%`;
+                badge.style.color = color;
+            }
             
             // Add to history
             positionHistory.push({ x: state.x, y: state.y, yaw: state.yaw });
