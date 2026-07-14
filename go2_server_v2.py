@@ -192,14 +192,29 @@ class Go2ServerV2:
         except SystemExit as e:
             # The driver sometimes calls sys.exit() on connection failure - catch it
             logger.warning(f"❌ Connection failed (driver exit): {e}")
-            self.robot_connected = False
-            self.robot = None
+            await self._cleanup_failed_connection()
             return False
         except Exception as e:
             logger.warning(f"❌ Connection failed: {e}")
-            self.robot_connected = False
-            self.robot = None
+            await self._cleanup_failed_connection()
             return False
+
+    async def _cleanup_failed_connection(self):
+        """Close a failed connection attempt's resources.
+
+        Each UnitreeWebRTCConnection opens sockets, an aiortc peer connection,
+        and decoder file handles. Dropping the reference without closing leaks
+        file descriptors - after days of 30s retries (dog powered off) the
+        process hits EMFILE and can never reconnect. (Observed: 'Too many open
+        files: libvoxel.wasm' after ~2 days of retries.)
+        """
+        self.robot_connected = False
+        if self.robot is not None:
+            try:
+                await asyncio.wait_for(self.robot.disconnect(), timeout=5)
+            except Exception as e:
+                logger.debug(f"Cleanup of failed connection: {e}")
+            self.robot = None
     
     async def disconnect_robot(self):
         """Disconnect from robot"""
@@ -269,8 +284,7 @@ class Go2ServerV2:
             except SystemExit as e:
                 # Driver sometimes calls sys.exit() - don't let it kill the server
                 logger.warning(f"Driver exit caught in reconnect loop: {e}")
-                self.robot_connected = False
-                self.robot = None
+                await self._cleanup_failed_connection()
                 await asyncio.sleep(self._reconnect_interval)
             except Exception as e:
                 logger.error(f"Reconnect loop error: {e}")

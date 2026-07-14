@@ -11,6 +11,7 @@ EnvironmentFile=/home/rpi1/dog_mcp/.env
 ExecStart=/home/rpi1/dog_mcp/venv/bin/python go2_server_v2.py
 Restart=always
 RestartSec=5
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
