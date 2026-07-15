@@ -151,9 +151,11 @@ class DogEventsServer:
         self.last_transition = 0.0
         self.online_since = None
 
-        # Agent activity (from contextHooks)
-        self.agent_busy = False
-        self.last_busy_change = time.monotonic()
+        # Agent activity (from contextHooks). Tracked per inferenceId because
+        # the host has a context-preview path that calls beforeInference with
+        # NO paired afterInference - a single boolean would wedge "busy".
+        # Each entry expires individually after BUSY_SAFETY_TIMEOUT.
+        self.active_inferences: dict = {}        # inferenceId -> monotonic start
         self.last_idle_time = time.monotonic()   # agent assumed idle at startup
 
         # Reminder machinery
@@ -219,13 +221,17 @@ class DogEventsServer:
 
         now = time.monotonic()
 
-        # Fail-open: if the host never told us inference finished, assume idle.
-        if self.agent_busy and now - self.last_busy_change > BUSY_SAFETY_TIMEOUT:
-            log("busy safety timeout - assuming idle")
-            self.agent_busy = False
-            self.last_idle_time = now
+        # Fail-open: expire inference entries the host never closed (e.g. the
+        # context-preview path sends beforeInference with no afterInference).
+        expired = [iid for iid, t0 in self.active_inferences.items()
+                   if now - t0 > BUSY_SAFETY_TIMEOUT]
+        for iid in expired:
+            log(f"busy safety timeout for {iid} - expiring")
+            del self.active_inferences[iid]
+            if not self.active_inferences:
+                self.last_idle_time = now
 
-        if self.agent_busy:
+        if self.active_inferences:
             return  # THE rule: a busy agent is never interrupted or queued at
 
         # One outstanding reminder at a time; re-arm only after the agent
@@ -259,8 +265,8 @@ class DogEventsServer:
     # ── Context hooks: busy/idle signal + interoception injection ────
 
     async def handle_before_inference(self, req_id, params):
-        self.agent_busy = True
-        self.last_busy_change = time.monotonic()
+        iid = (params or {}).get("inferenceId") or f"anon_{time.monotonic()}"
+        self.active_inferences[iid] = time.monotonic()
         self.reminder_outstanding_since = None  # the agent woke; cycle complete
 
         injections = []
@@ -281,10 +287,10 @@ class DogEventsServer:
         })
 
     async def handle_after_inference(self, req_id, params):
-        self.agent_busy = False
-        now = time.monotonic()
-        self.last_busy_change = now
-        self.last_idle_time = now
+        iid = (params or {}).get("inferenceId")
+        self.active_inferences.pop(iid, None)
+        if not self.active_inferences:
+            self.last_idle_time = time.monotonic()
         if req_id is not None:
             await self.rpc.send_response(req_id, {"featureSet": FS_NAME})
 
@@ -488,7 +494,8 @@ class DogEventsServer:
                 "relay": "connected" if self.relay_ok else "disconnected",
                 "body": {None: "unknown", True: "online", False: "offline"}[self.robot_connected],
                 "battery": f"{self.battery}%" if self.battery else "unknown",
-                "agentSeenAs": "busy" if self.agent_busy else f"idle {int(now - self.last_idle_time)}s",
+                "agentSeenAs": (f"busy ({len(self.active_inferences)} active)" if self.active_inferences
+                                 else f"idle {int(now - self.last_idle_time)}s"),
                 "remindersSent": self.reminders_sent,
                 "transitionPushes": self.events_emitted - self.reminders_sent,
             }
