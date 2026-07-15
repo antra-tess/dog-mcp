@@ -1,24 +1,36 @@
 #!/usr/bin/env python3
 """
-dog-events — MCPL server that wakes the agent when something happens to its body.
+dog-events — MCPL attention server for the robot dog body.
 
-Emits `push/event` (MCPL RFC) on:
-  - dog-online   : the robot connected to the relay (body became available)
-  - dog-offline  : the robot dropped off the relay for >60s (body lost)
-  - battery-low  : battery crossed below 20% / 10% (re-arms above 30%)
+Core idea: while the body is powered and in 'engaged' mode, an *idle* agent
+gets frequent wake reminders that the body is waiting (default: 5s after the
+agent goes idle). A *busy* agent gets nothing — not queued, not buffered:
+reminders are generated only at the moment the agent is idle, so there is
+never a backlog to dump.
 
-"Wake iff inactive" is a host property, not ours: the agent-framework gate
-buffers push events that arrive mid-inference and delivers them when the agent
-is idle, and the recipe's wake policies decide whether a push wakes the agent
-at all (match: {scope: ["mcpl:push-event"], source: "dog-events"}).
+How the server knows busy vs idle: MCPL contextHooks. The host calls
+context/beforeInference on us before every inference (agent -> busy) and
+context/afterInference when it completes (agent -> idle). Reminder generation
+is gated on that live signal. One reminder is outstanding at a time - the
+next one arms only after the agent has actually woken (we see the next
+beforeInference) and gone idle again.
 
-This server deliberately does NOT expose movement tools — it is a nervous
-system's interoception channel, not a control surface. Control lives in the
-main dog MCP server (go2_mcp_server_v2.py).
+Attention modes (agent-controllable via tools):
+  engaged  - body pulls attention: reminder after idleDelaySeconds (default 5)
+  ambient  - occasional nudges (default every 300s of idle)
+  quiet    - no reminders; transition events (online/offline/battery) only
+
+Transition events from v1 are unchanged and fire in every mode:
+  dog-online / dog-offline (debounced) and battery threshold crossings.
+
+Also injects a one-line body status into every inference context
+(beforeInference contextInjection), so even a busy agent has fresh
+interoception without being interrupted.
 
 Environment:
-  GO2_RELAY_URL, GO2_RELAY_SECRET, GO2_ROBOT_ID  — same as the other clients
-  DOG_EVENTS_BATTERY_THRESHOLDS  — comma-separated, default "20,10"
+  GO2_RELAY_URL, GO2_RELAY_SECRET, GO2_ROBOT_ID
+  DOG_EVENTS_CONFIG_FILE         — persisted attention config (default ./dog-events-config.json)
+  DOG_EVENTS_BATTERY_THRESHOLDS  — default "20,10"
   DOG_EVENTS_POLL_SECONDS        — battery poll interval, default 120
 """
 
@@ -34,21 +46,46 @@ import websockets
 RELAY_URL = os.environ.get("GO2_RELAY_URL", "ws://localhost:8080")
 RELAY_SECRET = os.environ.get("GO2_RELAY_SECRET", "")
 ROBOT_ID = os.environ.get("GO2_ROBOT_ID", "go2-home")
+CONFIG_FILE = os.environ.get("DOG_EVENTS_CONFIG_FILE", "./dog-events-config.json")
 BATTERY_THRESHOLDS = sorted(
     (int(x) for x in os.environ.get("DOG_EVENTS_BATTERY_THRESHOLDS", "20,10").split(",")),
     reverse=True,
 )
 POLL_SECONDS = int(os.environ.get("DOG_EVENTS_POLL_SECONDS", "120"))
-BATTERY_REARM = 30          # re-arm threshold alerts once charged above this
-OFFLINE_GRACE = 60          # robot must be gone this long before dog-offline
-ONLINE_STABLE = 10          # robot must be back this long before dog-online
-MIN_EVENT_INTERVAL = 300    # per-kind cooldown, seconds
+BATTERY_REARM = 30
+OFFLINE_GRACE = 60
+ONLINE_STABLE = 10
+TRANSITION_COOLDOWN = 300        # per-kind cooldown for transition events
+BUSY_SAFETY_TIMEOUT = 900        # assume idle if no afterInference in 15 min
+REMINDER_RETRY_TIMEOUT = 600     # re-arm if a reminder never produced a wake
 
 FS_NAME = "dog-events"
+DEFAULT_CONFIG = {
+    "mode": "engaged",            # engaged | ambient | quiet
+    "idleDelaySeconds": 5,        # engaged: remind this long after agent goes idle
+    "ambientIntervalSeconds": 300,
+}
 
 
 def log(*args):
     print("[dog-events]", *args, file=sys.stderr, flush=True)
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = {**DEFAULT_CONFIG, **json.load(f)}
+    except Exception:
+        cfg = dict(DEFAULT_CONFIG)
+    return cfg
+
+
+def save_config(cfg: dict):
+    try:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception as e:
+        log(f"config save failed: {e}")
 
 
 class StdioJsonRpc:
@@ -62,7 +99,7 @@ class StdioJsonRpc:
     async def read_message(self):
         line = await asyncio.to_thread(sys.stdin.readline)
         if not line:
-            return None  # EOF - host went away
+            return None
         line = line.strip()
         if not line:
             return {}
@@ -93,7 +130,6 @@ class StdioJsonRpc:
         return fut
 
     def resolve_response(self, msg: dict) -> bool:
-        """Route a response to our own outbound request. Returns True if handled."""
         fut = self._pending.pop(msg.get("id"), None)
         if fut is not None:
             if not fut.done():
@@ -107,12 +143,25 @@ class DogEventsServer:
         self.rpc = StdioJsonRpc()
         self.mcpl_enabled = False
         self.initialized = False
+        self.config = load_config()
 
-        # Robot state tracking
-        self.robot_connected = None      # None = unknown (startup baseline)
+        # Body state
+        self.robot_connected = None
         self.battery = None
         self.last_transition = 0.0
-        self.last_event_time: dict = {}  # kind -> monotonic ts
+        self.online_since = None
+
+        # Agent activity (from contextHooks)
+        self.agent_busy = False
+        self.last_busy_change = time.monotonic()
+        self.last_idle_time = time.monotonic()   # agent assumed idle at startup
+
+        # Reminder machinery
+        self.reminder_outstanding_since = None   # monotonic ts or None
+        self.reminders_sent = 0
+
+        # Transition events
+        self.last_event_time: dict = {}
         self.tripped_thresholds: set = set()
         self.events_emitted = 0
         self.relay_ok = False
@@ -120,12 +169,11 @@ class DogEventsServer:
     # ── Push emission ────────────────────────────────────────────────
 
     async def emit(self, kind: str, text: str, force: bool = False):
-        """Emit a push/event; host-side gate handles wake-iff-idle + buffering."""
         if not (self.mcpl_enabled and self.initialized):
             log(f"push suppressed (mcpl={self.mcpl_enabled}): {kind}")
             return
         now = time.monotonic()
-        if not force and now - self.last_event_time.get(kind, -1e9) < MIN_EVENT_INTERVAL:
+        if not force and now - self.last_event_time.get(kind, -1e9) < TRANSITION_COOLDOWN:
             log(f"push cooldown, dropped: {kind}")
             return
         self.last_event_time[kind] = now
@@ -151,10 +199,98 @@ class DogEventsServer:
         except asyncio.TimeoutError:
             log(f"push ack timeout: {kind}")
 
-    # ── Relay watcher ────────────────────────────────────────────────
+    # ── Attention loop: the heart of "wake iff idle" ─────────────────
+
+    async def attention_loop(self):
+        """Remind an IDLE agent that its powered body awaits. Never fires while
+        the agent is busy - generation (not delivery) is gated on idleness, so
+        a busy stretch produces zero backlog."""
+        while True:
+            await asyncio.sleep(1)
+            try:
+                await self._attention_tick()
+            except Exception as e:
+                log(f"attention tick error: {e}")
+
+    async def _attention_tick(self):
+        mode = self.config["mode"]
+        if mode == "quiet" or not self.robot_connected or not self.initialized:
+            return
+
+        now = time.monotonic()
+
+        # Fail-open: if the host never told us inference finished, assume idle.
+        if self.agent_busy and now - self.last_busy_change > BUSY_SAFETY_TIMEOUT:
+            log("busy safety timeout - assuming idle")
+            self.agent_busy = False
+            self.last_idle_time = now
+
+        if self.agent_busy:
+            return  # THE rule: a busy agent is never interrupted or queued at
+
+        # One outstanding reminder at a time; re-arm only after the agent
+        # actually woke (next beforeInference clears it) or a long timeout.
+        if self.reminder_outstanding_since is not None:
+            if now - self.reminder_outstanding_since > REMINDER_RETRY_TIMEOUT:
+                log("reminder never produced a wake - re-arming")
+                self.reminder_outstanding_since = None
+            else:
+                return
+
+        delay = (self.config["idleDelaySeconds"] if mode == "engaged"
+                 else self.config["ambientIntervalSeconds"])
+        idle_for = now - self.last_idle_time
+        if idle_for < delay:
+            return
+
+        self.reminder_outstanding_since = now
+        self.reminders_sent += 1
+        online_min = int((now - self.online_since) / 60) if self.online_since else 0
+        battery = f", battery {self.battery}%" if self.battery else ""
+        await self.emit(
+            "body-idle",
+            f"🐕 [body] Your body is powered on and idle ({mode} mode{battery}, "
+            f"online {online_min}m). You've been away from it ~{int(idle_for)}s. "
+            "Move, look, take a photo - or dog_attention_mode('ambient'/'quiet') "
+            "if you're focusing elsewhere.",
+            force=True,
+        )
+
+    # ── Context hooks: busy/idle signal + interoception injection ────
+
+    async def handle_before_inference(self, req_id, params):
+        self.agent_busy = True
+        self.last_busy_change = time.monotonic()
+        self.reminder_outstanding_since = None  # the agent woke; cycle complete
+
+        injections = []
+        if self.config["mode"] != "quiet" and self.robot_connected is not None:
+            if self.robot_connected:
+                battery = f", battery {self.battery}%" if self.battery else ""
+                status = f"online{battery}, attention mode: {self.config['mode']}"
+            else:
+                status = "offline"
+            injections.append({
+                "namespace": FS_NAME,
+                "position": "beforeUser",
+                "content": f"🐕 [body] {status}",
+            })
+        await self.rpc.send_response(req_id, {
+            "featureSet": FS_NAME,
+            "contextInjections": injections,
+        })
+
+    async def handle_after_inference(self, req_id, params):
+        self.agent_busy = False
+        now = time.monotonic()
+        self.last_busy_change = now
+        self.last_idle_time = now
+        if req_id is not None:
+            await self.rpc.send_response(req_id, {"featureSet": FS_NAME})
+
+    # ── Relay watcher (body presence + battery) ──────────────────────
 
     async def watch_relay(self):
-        """Maintain a client connection to the relay; track robot presence."""
         while True:
             try:
                 async with websockets.connect(RELAY_URL) as ws:
@@ -182,9 +318,10 @@ class DogEventsServer:
             prev = self.robot_connected
             self.robot_connected = connected
             self.last_transition = time.monotonic()
+            self.online_since = time.monotonic() if connected else None
             if prev is None:
                 log(f"baseline: robot {'online' if connected else 'offline'}")
-                return  # startup baseline - transitions only, no announce
+                return
             if connected and not prev:
                 asyncio.get_event_loop().create_task(self._debounced_online())
             elif prev and not connected:
@@ -200,9 +337,9 @@ class DogEventsServer:
         if self.robot_connected and self.last_transition == marker:
             await self.emit(
                 "dog-online",
-                f"🐕 [dog-events] Your body just came online (robot '{ROBOT_ID}' connected"
+                f"🐕 [dog-events] Your body just came online (robot '{ROBOT_ID}'"
                 f"{f', battery {self.battery}%' if self.battery else ''}). "
-                "It is available if you want to look around or move.",
+                f"Attention mode: {self.config['mode']}.",
             )
 
     async def _debounced_offline(self):
@@ -212,11 +349,10 @@ class DogEventsServer:
             await self.emit(
                 "dog-offline",
                 f"🔌 [dog-events] Your body went offline (robot '{ROBOT_ID}' disconnected "
-                f"from the relay over {OFFLINE_GRACE}s ago). Powered down or out of range.",
+                f"over {OFFLINE_GRACE}s ago). Powered down or out of range.",
             )
 
     async def _battery_poll(self, ws):
-        """Poll battery while robot is online (rides the same relay socket)."""
         while True:
             await asyncio.sleep(POLL_SECONDS)
             if not self.robot_connected:
@@ -232,7 +368,7 @@ class DogEventsServer:
 
     async def _handle_battery(self, soc):
         if not isinstance(soc, (int, float)) or soc <= 0:
-            return  # BMS not reporting yet
+            return
         self.battery = int(soc)
         if self.battery > BATTERY_REARM:
             self.tripped_thresholds.clear()
@@ -244,10 +380,9 @@ class DogEventsServer:
                 await self.emit(
                     f"battery-{threshold}",
                     f"{urgency} [dog-events] Your body's battery is at {self.battery}% "
-                    f"(crossed the {threshold}% threshold). "
-                    + ("Consider parking it near its charger and asking for a charge."
-                       if threshold <= BATTERY_THRESHOLDS[-1]
-                       else "Plan movement accordingly."),
+                    f"(crossed {threshold}%). "
+                    + ("Park it near the charger and ask for a charge."
+                       if threshold <= BATTERY_THRESHOLDS[-1] else "Plan movement accordingly."),
                     force=True,
                 )
                 break
@@ -257,14 +392,32 @@ class DogEventsServer:
     TOOLS = [
         {
             "name": "dog_events_status",
-            "description": "Show the dog-events monitor state: relay link, robot presence, "
-                           "battery, thresholds, and how many wake pushes have been sent.",
+            "description": "Show the dog attention monitor: mode, body presence, battery, "
+                           "reminder settings, agent-activity view, pushes sent.",
             "inputSchema": {"type": "object", "properties": {}},
         },
         {
+            "name": "dog_attention_mode",
+            "description": "Set how strongly your powered-on body pulls your attention. "
+                           "'engaged': wake reminders when you go idle (default 5s). "
+                           "'ambient': occasional nudges (default every 5 min idle). "
+                           "'quiet': no reminders, transition events only. Persists.",
+            "inputSchema": {"type": "object", "properties": {
+                "mode": {"type": "string", "enum": ["engaged", "ambient", "quiet"]},
+            }, "required": ["mode"]},
+        },
+        {
+            "name": "dog_attention_config",
+            "description": "Tune reminder timing: idleDelaySeconds (engaged mode, min 5) "
+                           "and/or ambientIntervalSeconds (ambient mode, min 60). Persists.",
+            "inputSchema": {"type": "object", "properties": {
+                "idleDelaySeconds": {"type": "number"},
+                "ambientIntervalSeconds": {"type": "number"},
+            }},
+        },
+        {
             "name": "dog_events_test_push",
-            "description": "Emit a test wake push through the dog-events channel to verify "
-                           "the wiring (event -> host gate -> wake policy).",
+            "description": "Emit a test wake push to verify wiring (event -> gate -> wake).",
             "inputSchema": {"type": "object", "properties": {}},
         },
     ]
@@ -286,10 +439,15 @@ class DogEventsServer:
                     "pushEvents": True,
                     "channels": False,
                     "rollback": False,
+                    "contextHooks": {
+                        "beforeInference": True,
+                        "afterInference": {"blocking": False},
+                    },
                     "featureSets": [{
                         "name": FS_NAME,
-                        "description": "Embodiment interoception: wake events for the robot dog "
-                                       "(online/offline, low battery).",
+                        "description": "Embodiment attention: idle-body reminders (only when "
+                                       "you are idle - never queued while busy), online/offline "
+                                       "and battery events, body status in context.",
                         "uses": ["tools"],
                         "rollback": False,
                         "hostState": False,
@@ -298,11 +456,15 @@ class DogEventsServer:
             await self.rpc.send_response(req_id, {
                 "protocolVersion": "2024-11-05",
                 "capabilities": caps,
-                "serverInfo": {"name": "dog-events", "version": "0.1.0"},
+                "serverInfo": {"name": "dog-events", "version": "0.2.0"},
             })
             log(f"initialized ({'MCPL' if self.mcpl_enabled else 'plain MCP'} mode)")
         elif method == "notifications/initialized":
             self.initialized = True
+        elif method == "context/beforeInference":
+            await self.handle_before_inference(req_id, msg.get("params") or {})
+        elif method == "context/afterInference":
+            await self.handle_after_inference(req_id, msg.get("params") or {})
         elif method == "tools/list":
             await self.rpc.send_response(req_id, {"tools": self.TOOLS})
         elif method == "tools/call":
@@ -316,29 +478,54 @@ class DogEventsServer:
 
     async def _handle_tool(self, req_id, params: dict):
         name = params.get("name")
+        args = params.get("arguments") or {}
         if name == "dog_events_status":
+            now = time.monotonic()
             status = {
+                "attentionMode": self.config["mode"],
+                "idleDelaySeconds": self.config["idleDelaySeconds"],
+                "ambientIntervalSeconds": self.config["ambientIntervalSeconds"],
                 "relay": "connected" if self.relay_ok else "disconnected",
-                "robot": {None: "unknown", True: "online", False: "offline"}[self.robot_connected],
+                "body": {None: "unknown", True: "online", False: "offline"}[self.robot_connected],
                 "battery": f"{self.battery}%" if self.battery else "unknown",
-                "batteryThresholds": BATTERY_THRESHOLDS,
-                "trippedThresholds": sorted(self.tripped_thresholds),
-                "pushesSent": self.events_emitted,
-                "mcplMode": self.mcpl_enabled,
+                "agentSeenAs": "busy" if self.agent_busy else f"idle {int(now - self.last_idle_time)}s",
+                "remindersSent": self.reminders_sent,
+                "transitionPushes": self.events_emitted - self.reminders_sent,
             }
-            text = "🐕 dog-events monitor\n" + json.dumps(status, indent=2)
+            text = "🐕 dog attention monitor\n" + json.dumps(status, indent=2)
+        elif name == "dog_attention_mode":
+            mode = args.get("mode")
+            if mode not in ("engaged", "ambient", "quiet"):
+                await self.rpc.send_error(req_id, -32602, f"Invalid mode: {mode}")
+                return
+            self.config["mode"] = mode
+            self.reminder_outstanding_since = None
+            save_config(self.config)
+            text = {"engaged": "🐕 Engaged - your body will pull your attention when you're idle.",
+                    "ambient": "🌤 Ambient - occasional nudges while the body is on.",
+                    "quiet": "🤫 Quiet - no reminders; you'll still hear about power and battery."}[mode]
+        elif name == "dog_attention_config":
+            if "idleDelaySeconds" in args:
+                self.config["idleDelaySeconds"] = max(5, int(args["idleDelaySeconds"]))
+            if "ambientIntervalSeconds" in args:
+                self.config["ambientIntervalSeconds"] = max(60, int(args["ambientIntervalSeconds"]))
+            save_config(self.config)
+            text = (f"Reminder timing: engaged={self.config['idleDelaySeconds']}s idle, "
+                    f"ambient=every {self.config['ambientIntervalSeconds']}s idle.")
         elif name == "dog_events_test_push":
-            await self.emit("test", "🧪 [dog-events] Test wake push - the wiring works. "
-                                    "You asked for this via dog_events_test_push.", force=True)
-            text = "Test push emitted (check that it arrives as a wake/queued event)."
+            await self.emit("test", "🧪 [dog-events] Test wake push - the wiring works.", force=True)
+            text = "Test push emitted."
         else:
             await self.rpc.send_error(req_id, -32602, f"Unknown tool: {name}")
             return
         await self.rpc.send_response(req_id, {"content": [{"type": "text", "text": text}]})
 
     async def run(self):
-        log(f"starting: relay={RELAY_URL} robot={ROBOT_ID} thresholds={BATTERY_THRESHOLDS}")
-        watcher = asyncio.get_event_loop().create_task(self.watch_relay())
+        log(f"starting v0.2: relay={RELAY_URL} robot={ROBOT_ID} mode={self.config['mode']} "
+            f"idleDelay={self.config['idleDelaySeconds']}s")
+        loop = asyncio.get_event_loop()
+        tasks = [loop.create_task(self.watch_relay()),
+                 loop.create_task(self.attention_loop())]
         try:
             while True:
                 msg = await self.rpc.read_message()
@@ -348,7 +535,8 @@ class DogEventsServer:
                 if msg:
                     await self.handle_message(msg)
         finally:
-            watcher.cancel()
+            for t in tasks:
+                t.cancel()
 
 
 if __name__ == "__main__":
