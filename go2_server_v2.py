@@ -688,7 +688,36 @@ class Go2ServerV2:
         logger.info(f"🎛️ LiDAR decode throttled to 1 frame per {min_interval}s")
 
     # ============ Closed-Loop Movement ============
-    
+
+    async def _ensure_ready_to_move(self) -> str:
+        """Get the body into a state where velocity commands work.
+
+        Two silent no-motion states exist:
+        - Lying down (body_height ~0.08): ignores all velocity. Auto StandUp.
+        - Locked stand (right after StandUp): also ignores velocity until
+          switched to active balance. BalanceStand unlocks it. Observed
+          deterministically: first move after StandUp fails, second works.
+
+        Returns "" if ready, otherwise a failure reason.
+        """
+        state = await self._get_current_state()
+        if state.body_height < 0.15:
+            logger.info("🧍 Body is lying down - standing up first")
+            self._send_sport_command_nowait("StandUp")
+            for _ in range(40):  # up to 4s
+                await asyncio.sleep(0.1)
+                state = await self._get_current_state()
+                if state.body_height > 0.25:
+                    break
+            else:
+                return f"body would not stand up (height {state.body_height:.2f}m)"
+            await asyncio.sleep(0.5)  # let it settle
+
+        # Unlock locked-stand into active balance; harmless if already balanced.
+        self._send_sport_command_nowait("BalanceStand")
+        await asyncio.sleep(0.3)
+        return ""
+
     async def _cancel_existing_movement(self):
         """Cancel any existing move/turn command before starting a new one"""
         if self._movement_task and not self._movement_task.done():
@@ -731,10 +760,16 @@ class Go2ServerV2:
         
         if abs(target_distance) < 0.01:
             return {"status": "completed", "data": {"distance": 0, "actual": 0}}
-        
-        # Get initial position
+
+        # Make sure the body can actually walk (stand up + unlock balance)
+        not_ready = await self._ensure_ready_to_move()
+        if not_ready:
+            return {"status": "failed", "error": "not_ready", "data": {"reason": not_ready}}
+
+        # Get initial position and heading (for signed, direction-verified odometry)
         initial = await self._get_current_state()
         initial_x, initial_y = initial.x, initial.y
+        heading_x, heading_y = math.cos(initial.yaw), math.sin(initial.yaw)
         
         logger.info(f"🚶 Moving {target_distance}m from ({initial_x:.3f}, {initial_y:.3f})")
         
@@ -744,22 +779,35 @@ class Go2ServerV2:
         last_log_time = 0
         last_cmd_time = 0
         
-        # Stall detection
+        # Stall detection - two phases. Launch: the dog sometimes takes >2s to
+        # engage its gait from standstill (settling after a previous motion, OA
+        # re-planning) with zero odometry movement, then starts fine - observed
+        # bimodal starts: moving within ~0.5s, or nothing for 2s+. So give
+        # launches a longer grace and one joystick re-push "kick" before
+        # declaring failure. Cruise: once moving, expect steady progress.
+        LAUNCH_GRACE = 5.0       # max time to first movement
+        LAUNCH_KICK_AT = 2.5     # re-push the stick if not moving by this time
+        LAUNCH_MOVED = 0.05      # odometry distance that counts as "started"
+        launch_kicked = False
+        started = False
         last_stall_check_time = start_time
         last_stall_check_distance = 0
         stalled = False
-        
+        stall_reason = ""
+
         try:
             while True:
                 current_time = asyncio.get_event_loop().time()
                 elapsed = current_time - start_time
                 
-                # Get current position
+                # Signed distance: displacement projected onto the initial
+                # heading, times commanded direction. Positive = progressing as
+                # commanded; a wrong-direction walk shows up negative instead
+                # of silently "completing" (an unsigned norm hid an inverted
+                # joystick axis for days).
                 current = await self._get_current_state()
-                actual_distance = math.sqrt(
-                    (current.x - initial_x) ** 2 + 
-                    (current.y - initial_y) ** 2
-                )
+                dx, dy = current.x - initial_x, current.y - initial_y
+                actual_distance = (dx * heading_x + dy * heading_y) * direction
                 
                 # Check if target reached (stop slightly early - momentum carries
                 # the robot the last few cm after the stick is released)
@@ -781,13 +829,46 @@ class Go2ServerV2:
                     logger.warning(f"⏱️ Timeout after {elapsed:.1f}s, traveled {actual_distance:.3f}m")
                     break
                 
-                # Stall detection - check if we're making progress
-                # Grace period: don't check until 2s elapsed (allow ramp-up)
-                if elapsed > 2.0 and current_time - last_stall_check_time >= stall_check_period:
+                # SAFETY: wrong-direction guard. Signed odometry going negative
+                # means the body is moving OPPOSITE to the command (sign bug,
+                # slipping, being pushed). Stop immediately - never keep
+                # pushing the stick while displacement disagrees with intent.
+                if actual_distance < -0.08:
+                    self._release_joystick()
+                    logger.error(f"🛑 WRONG DIRECTION: commanded {target_distance:+.2f}m but moved {actual_distance:.2f}m - aborting")
+                    return {
+                        "status": "failed",
+                        "error": "wrong_direction",
+                        "data": {"target": target_distance, "actual": actual_distance * direction,
+                                 "reason": "body moved opposite to the commanded direction - aborted for safety"}
+                    }
+
+                # Stall detection - launch phase, then cruise phase
+                if not started and actual_distance > LAUNCH_MOVED:
+                    started = True
+                    last_stall_check_time = current_time
+                    last_stall_check_distance = actual_distance
+                    logger.info(f"  🏃 Gait engaged after {elapsed:.1f}s")
+
+                if not started:
+                    if not launch_kicked and elapsed > LAUNCH_KICK_AT:
+                        # One brief stick release + re-push sometimes kicks a
+                        # reluctant gait engine into starting.
+                        launch_kicked = True
+                        logger.info("  👟 No movement yet - kicking (release + re-push)")
+                        self._release_joystick()
+                        await asyncio.sleep(0.1)
+                    elif elapsed > LAUNCH_GRACE:
+                        logger.warning(f"🛑 Never started moving within {LAUNCH_GRACE}s")
+                        stalled = True
+                        stall_reason = "never started moving (gait did not engage - possibly obstacle-blocked or robot settling; retry usually works)"
+                        break
+                elif current_time - last_stall_check_time >= stall_check_period:
                     distance_since_check = actual_distance - last_stall_check_distance
                     if distance_since_check < stall_threshold:
-                        logger.warning(f"🛑 Stalled! Only moved {distance_since_check:.3f}m in {stall_check_period}s (threshold: {stall_threshold:.3f}m)")
+                        logger.warning(f"🛑 Stalled mid-move! Only {distance_since_check:.3f}m in {stall_check_period}s (threshold: {stall_threshold:.3f}m)")
                         stalled = True
+                        stall_reason = "stopped making progress mid-move - likely obstacle"
                         break
                     last_stall_check_time = current_time
                     last_stall_check_distance = actual_distance
@@ -795,6 +876,9 @@ class Go2ServerV2:
                 # Hold the virtual joystick: stream deflection frames continuously.
                 # Deflection is normalized -1..1; map speed (0.2-0.5 m/s) into it.
                 # Ease out over the last 25cm to cut overshoot.
+                # Axis: ly POSITIVE = forward (matches upstream example; verified
+                # the hard way - do NOT flip without a supervised signed-odometry
+                # test, see the wrong-direction guard above).
                 remaining = abs(target_distance) - actual_distance
                 ease = max(0.5, min(remaining / 0.25, 1.0))
                 deflection = max(0.35, min(1.8 * speed, 0.95)) * ease
@@ -824,7 +908,7 @@ class Go2ServerV2:
                 logger.warning(f"StopMove after move failed: {e}")
         
         if stalled:
-            logger.info(f"🚫 Move failed (stalled): target={target_distance:.2f}m actual={actual_distance:.2f}m")
+            logger.info(f"🚫 Move failed (stalled): target={target_distance:.2f}m actual={actual_distance:.2f}m ({stall_reason})")
             return {
                 "status": "failed",
                 "error": "stalled",
@@ -832,7 +916,7 @@ class Go2ServerV2:
                     "target": target_distance,
                     "actual": actual_distance * direction,
                     "position": {"x": current.x, "y": current.y},
-                    "reason": "Robot stalled - possible obstacle"
+                    "reason": stall_reason or "Robot stalled - possible obstacle"
                 }
             }
         
@@ -865,7 +949,12 @@ class Go2ServerV2:
         
         target_angle = math.radians(target_angle_deg)
         stall_threshold = math.radians(stall_threshold_deg)
-        
+
+        # Make sure the body can actually walk (stand up + unlock balance)
+        not_ready = await self._ensure_ready_to_move()
+        if not_ready:
+            return {"status": "failed", "error": "not_ready", "data": {"reason": not_ready}}
+
         # Get initial orientation
         initial = await self._get_current_state()
         initial_yaw = initial.yaw
