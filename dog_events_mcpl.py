@@ -256,9 +256,7 @@ class DogEventsServer:
         await self.emit(
             "body-idle",
             f"🐕 [body] Your body is powered on and idle ({mode} mode{battery}, "
-            f"online {online_min}m). You've been away from it ~{int(idle_for)}s. "
-            "Move, look, take a photo - or dog_attention_mode('ambient'/'quiet') "
-            "if you're focusing elsewhere.",
+            f"online {online_min}m).",
             force=True,
         )
 
